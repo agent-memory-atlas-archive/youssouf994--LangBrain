@@ -6,6 +6,7 @@ Posizione: examples/medical_homeostasis/demo_medical_homeostasis.py
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -13,11 +14,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+# Database dedicato alla demo: i tuoi dati non vengono toccati. Va impostato prima di importare l'applicazione.
+os.environ.setdefault("DB_PATH", str(ROOT / "demo_medica.db"))
+
 from app.agents.agent_registry import AgentRegistry
 from app.agents.medical_agents import CardiovascularOrganAgent, RespiratoryOrganAgent
-from app.db.database import Database
+from app.db.database import DB_PATH
+from app.db.scenario import crea_scenario
 from app.graph.builder import build_graph
 from app.tools.event_log import EventLog
+from app.tools.sensor_tools import registra_tool
 from app.tools.medical_tools import (
     HeartRateRegulatorTool,
     LungVentilatorTool,
@@ -31,9 +37,8 @@ logger = logging.getLogger("demo_medical_homeostasis")
 async def main():
     logger.info("=== AVVIO DEMO PATOLOGIA MEDICA & OMEOSTASI FISIOLOGICA ===")
 
-    # 1. Inizializzazione DB e Registri
-    db = Database()
-    await db.init_db()
+    # 1. Database della demo azzerato a ogni esecuzione, così gli eventi di una prova non influenzano la successiva
+    await crea_scenario(DB_PATH, "vuoto")
     event_log = EventLog()
 
     # Istanzia i tool medici
@@ -45,6 +50,9 @@ async def main():
     }
 
     # Istanzia gli agenti di organo fisiologico
+    # Registrati nel registry condiviso, i tool medici li trova anche il Brain quando approva un'escalation
+    for nome, tool in medical_tools.items():
+        registra_tool(nome, tool)
     cardio_agent = CardiovascularOrganAgent(tools=medical_tools)
     resp_agent = RespiratoryOrganAgent(tools=medical_tools)
 
@@ -55,7 +63,8 @@ async def main():
 
     # 2. Compila il grafo con gli agenti medici
     graph, shared_tools = build_graph(custom_agent_instances=custom_instances)
-    thread_config = {"configurable": {"thread_id": "medical_pathology_session"}}
+    config_cardio = {"configurable": {"thread_id": "medical_cardio"}}
+    config_respiro = {"configurable": {"thread_id": "medical_respiratory"}}
 
     # -------------------------------------------------------------------
     # FASE 1: STATO DI SALUTE INIZIALE (OMEOSTASI NORMALE)
@@ -91,22 +100,33 @@ async def main():
         "config": {},
     }
 
-    res_cardio = await graph.ainvoke(state_cardio, config=thread_config)
+    res_cardio = await graph.ainvoke(state_cardio, config=config_cardio)
     messages_cardio = res_cardio.get("messages", [])
     if messages_cardio:
         logger.info("Esito Agente Cardiovascolare: %s", messages_cardio[-1].content)
 
     # -------------------------------------------------------------------
-    # FASE 3b: RICONCILIAZIONE BRAIN / AGENTE CARDIOVASCOLARE SU PACEMAKER
+    # FASE 3b: ESITO DELL'ESCALATION E, SE SERVE, INTERVENTO DELL'OPERATORE
     # -------------------------------------------------------------------
-    logger.info("\n--- [FASE 3b] Ripristino Omeostatico del Pacemaker Cardiaco (100 BPM) ---")
-    await cardio_agent.apply_status(
-        target="cardiac_pacemaker",
-        action="HOMEOSTASIS_BPM_RESTORATION",
-        new_value="100.0 BPM",
-        reasoning="Risoluzione Aritmia Severa ed allineamento target omeostatico a 100 BPM.",
-        tools_map=medical_tools,
-    )
+    # Il Brain valuta l'escalation con il suo modello e può approvarla (il pacemaker è già a 100 BPM) oppure respingerla.
+    # Un rifiuto del Brain (priorità massima) blocca il dispositivo: l'agente cardiaco non può forzarlo, serve un
+    # operatore che sblocchi. È la catena di responsabilità prevista dal framework.
+    logger.info("\n--- [FASE 3b] Esito dell'escalation al Brain sul Pacemaker Cardiaco ---")
+    await event_log.mark_resolved("cardiac_pacemaker")
+    if pacemaker.normalize_current_state()["is_in_range"]:
+        logger.info("Il Brain ha approvato: il pacemaker è già a %s.", await pacemaker.get_tool_value())
+    else:
+        logger.info("Il Brain ha respinto l'escalation: il pacemaker è bloccato a %s. L'operatore lo sblocca.", await pacemaker.get_tool_value())
+        await event_log.unblock_target("cardiac_pacemaker", "Sblocco dell'operatore dopo il rifiuto del Brain", actor="operatore_umano")
+        esito = await cardio_agent.applica_stato(
+            target="cardiac_pacemaker",
+            action="HOMEOSTASIS_BPM_RESTORATION",
+            new_value="100.0 BPM",
+            reasoning="Ripristino del target omeostatico a 100 BPM dopo lo sblocco dell'operatore.",
+            escalated=False,
+            tools_map=medical_tools,
+        )
+        logger.info("Ripristino dopo lo sblocco: %s", esito["status"])
 
     # -------------------------------------------------------------------
     # FASE 4: INTERVENTO DELL'AGENTE RESPIRATORIO PER RISOLUZIONE IPOSSIA
@@ -122,7 +142,7 @@ async def main():
         "config": {},
     }
 
-    res_resp = await graph.ainvoke(state_resp, config=thread_config)
+    res_resp = await graph.ainvoke(state_resp, config=config_respiro)
     messages_resp = res_resp.get("messages", [])
     if messages_resp:
         logger.info("Esito Agente Respiratorio: %s", messages_resp[-1].content)

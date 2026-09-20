@@ -3,13 +3,30 @@
 # 🤖 LangBrain
 
 > [!WARNING]
-> **LangBrain non è pronto per l'uso in produzione.** È un prototipo/boilerplate dimostrativo: prima di usarlo in ambienti reali occorre completare gli interventi di sicurezza, persistenza, concorrenza, deployment, observability e testing elencati in [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
+> **LangBrain è un boilerplate funzionante, ma non è pronto per la produzione:** un solo worker, dispositivi simulati con stato in memoria, nessuna observability. I limiti noti e la roadmap sono in [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
 
 **Un corpo digitale per i tuoi progetti di automazione intelligente ed agenti gerarchici.**
 
 Un boilerplate LangGraph sperimentale che implementa un pattern di agenti gerarchici ispirato al modo in cui funziona un organismo: un **cervello** (Orchestratore Supremo) che pensa in modo ponderato e concilia i conflitti, e **organi/componenti** (sotto-agenti a N-livelli) che reagiscono in tempo reale, agendo in autonomia quando serve ed escalando ai livelli superiori solo quando la situazione lo richiede.
 
 Il caso d'uso dimostrativo principale è una **smart home**, affiancato da una demo avanzata di **omeostasi medica e fisiologica**, ma l'architettura è pensata per essere trapiantata in qualsiasi dominio — customer support, monitoraggio industriale, gestione flotte, e molto altro.
+
+---
+
+## 🚀 Avvio rapido
+
+Serve Python 3.12 o superiore.
+
+```bash
+python -m venv venv && source venv/bin/activate    # su Windows: .\venv\Scripts\Activate.ps1
+python -m pip install -r requirements-dev.txt
+cp .env.example .env                               # inserisci almeno la chiave di un provider LLM
+python examples/avvia_demo.py                      # scenario di prova + pagina "grafo in azione"
+```
+
+La demo crea un database dedicato (`demo.db`, i tuoi dati non vengono toccati), avvia il server e apre `http://127.0.0.1:8765/demo`. Premi **Esegui un ciclo**: i nodi della gerarchia si illuminano uno dopo l'altro mentre gli agenti (modelli reali) ragionano, gli eventi e i dispositivi si aggiornano e, quando il Brain chiede l'approvazione per la porta, decidi tu con **Approva** o **Respingi**.
+
+Per il server vero: `python -m uvicorn app.api.main:app` oppure `docker compose up`. Le scelte dell'utente (dispositivi e valori ammessi, provider e modelli, HITL, timer) stanno in [`configurazione.toml`](configurazione.toml), i segreti nel `.env`. La guida completa è in [`docs/HOW_TO_CUSTOMIZE.md`](docs/HOW_TO_CUSTOMIZE.md); sicurezza e contributi in [`SECURITY.md`](SECURITY.md) e [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ---
 
@@ -22,19 +39,6 @@ Il tuo corpo non funziona così. Se metti la mano su una piastra bollente, **non
 Questo boilerplate replica esattamente questa logica:
 
 - **Il Cervello (Orchestratore Supremo - Livello 0)** — pensa in modo ciclico, guarda la storia recente e decide aggiustamenti strategici o risoluzioni di conflitti.
-
-
-Aggiornamenti recenti (2026-09-04): il repository include alcune correzioni di stabilità e sicurezza esercitate dagli smoke test. Aggiornamenti principali:
-
-- Checkpointer persistente in-process (wrapper file-backed attorno a `InMemorySaver`) per ridurre la perdita di stato alla ricompilazione del grafo (`app/checkpointer.py`).
-- Ricompilazione del grafo protetta da `asyncio.Lock` e sostituzione più sicura di `_shared_tools` (`app/api/main.py`).
-- `BaseAgent.apply_status()` ora segnala correttamente il successo dell'attuazione e fallisce quando l'attuazione del tool o il logging sul DB falliscono.
-- `check_priority_lock()` applica il `priority_weight` configurato nel registro agenti; `Brain` mantiene la priorità più alta.
-- L'opzione HITL `allow_override` è configurabile via API; è disponibile una modalità di test del MAO (`MAO_ENABLE_MOCK=1`) per evitare chiamate a provider esterni durante lo sviluppo.
-- Script smoke aggiornato e documentato: `examples/deep_hierarchy_smoke.sh` (gerarchia a 6 livelli che esercita HITL/OVERRIDE).
-- La suite di test e le regressioni sono eseguibili localmente; i test principali sono stati eseguiti con esito positivo nell'ambiente di audit.
-
-Questi cambiamenti migliorano l'esperienza di sviluppo e rendono i flussi demo più deterministici; non rendono il progetto pronto per la produzione (autenticazione, checkpointer DB-persistent e RBAC restano da implementare).
 - **Gli Organi & Componenti (Sotto-agenti N-Livelli)** — specializzati per macro-aree o periferiche. Reagiscono in autonomia entro le loro soglie di competenza, ed **escalano al Padre** quando la situazione è ambigua o conflittuale.
 - **Il Sistema Nervoso (Event Log & Audit)** — è il canale attraverso cui ogni agente registra cosa ha fatto e legge le azioni recenti per evitare conflitti o sovrascrizioni.
 
@@ -100,6 +104,8 @@ Agiscono in autonomia per il loro target sensore/dispositivo. Se rilevano un con
 
 L'interruzione per approvazione umana può essere inserita **dinamicamente ovunque nel flusso del grafo** tramite il wrapper in `app/graph/builder.py` e gestita 100% via API REST senza riavviare il server.
 
+- **Dove si applica (scelta dell'utente):** in `configurazione.toml`, `[hitl] livello` sceglie tra `nodi` (il wrapper ferma i nodi che indichi), `brain` (il Brain chiede l'approvazione per i target critici) ed `entrambi`. Le pause di emergenza (modello LLM non utilizzabile, guasto di un dispositivo non risolto) restano attive con qualsiasi livello.
+- **Timer:** con `[hitl] timer_attivo = 1` l'API espone i secondi rimanenti e, alla scadenza, decide il sistema (il Brain con il suo modello), respinge oppure lascia il grafo in pausa, secondo `azione_alla_scadenza`.
 - **Attivazione Dinamica via API:**
   `POST /hitl/config` consente di specificare nodi (`hitl_nodes`), sensori protetti (`hitl_targets`), azioni critiche (`hitl_actions`) e l'attesa massima in secondi (`max_wait_seconds`).
 
@@ -107,7 +113,7 @@ L'interruzione per approvazione umana può essere inserita **dinamicamente ovunq
 
   | `decision` | Comportamento |
   |---|---|
-  | `APPROVA` | Scrive `RECONCILED_<action>` nel DB. Nessuna modifica fisica al dispositivo. |
+  | `APPROVA` | Il Brain applica al dispositivo l'azione proposta (se è un comando ammesso da `configurazione.toml`) e scrive `RECONCILED_<action>` nel DB. |
   | `RESPINGI` | Scrive `REJECTED_<action>` nel DB. Il device rimane bloccato fino a TTL o unblock manuale. |
   | `OVERRIDE` | **God Mode Semantico**: il campo `reasoning` in linguaggio naturale viene inviato al MAO con un prompt di Arbitrato Semantico. Il MAO traduce la frase in un array JSON di comandi `{target, action, value}` eseguiti fisicamente via `force_execute_tool`, che bypassa tutti i lock di priorità e traccia ogni azione nel DB con `actor: "Brain_Override"`. |
 
@@ -129,49 +135,72 @@ L'interruzione per approvazione umana può essere inserita **dinamicamente ovunq
 
 ```text
 LangBrain/
-├── REQUIREMENTS.md
+├── README.md / README.en.md
+├── REQUIREMENTS.md / REQUIREMENTS.en.md
+├── SECURITY.md                     # Come segnalare vulnerabilità e cosa aspettarsi dalla sicurezza
+├── CONTRIBUTING.md                 # Come contribuire
+├── LICENCE
 ├── Dockerfile
 ├── docker-compose.yml
-├── requirements.txt
-├── test_results.json               # Esito in tempo reale della suite di test
-├── .env                            # Provider LLM e Prompt configurabili del Brain
-├── .env.example                    # Template di configurazione senza segreti
+├── requirements.txt                # Dipendenze dirette, versioni esatte
+├── requirements.lock               # Elenco completo fissato (usato dal Dockerfile)
+├── requirements-dev.txt            # In più pytest
+├── .env.example                    # Template dei segreti (chiavi dei provider e dell'API); il tuo .env resta fuori da Git
+├── configurazione.toml             # Scelte dell'utente: dispositivi e valori ammessi, provider LLM, HITL e timer
+├── run_loop.py                     # Loop event-driven con produttore di eventi dei sensori
+├── .github/workflows/ci.yml        # CI: test su Python 3.12/3.14, scansione segreti e dipendenze
 ├── app/
 │   ├── MAO/
-│   │   └── model_access_object.py  # Model Access Object (OpenRouter, Gemini, LLM Locale)
+│   │   └── model_access_object.py  # Model Access Object (OpenRouter, Google AI Studio, Mistral, LLM locale)
 │   ├── agents/
-│   │   ├── base_agent.py           # DNA comune di ogni agente (applica stato, idoneità, escalation)
+│   │   ├── base_agent.py           # DNA comune di ogni agente (applica stato, priorità, escalation)
 │   │   ├── agent_climate.py        # Agente Clima nativo
-│   │   ├── dynamic_agent.py        # Agente Dinamico configurabile a runtime (Livelli 1..N)
-│   │   ├── agent_registry.py       # Registro gerarchico salvato su DB SQLite
-│   │   └── medical_agents.py       # Agenti Fisiologici (Cardiovascolare, Respiratorio)
+│   │   ├── dynamic_agent.py        # Agente dinamico configurabile a runtime (Livelli 1..N)
+│   │   ├── agent_registry.py       # Registro gerarchico su SQLite
+│   │   └── medical_agents.py       # Agenti fisiologici (Cardiovascolare, Respiratorio)
+│   ├── core/
+│   │   ├── configurazione.py       # Lettura e validazione di configurazione.toml
+│   │   ├── constants.py            # Flag di controllo e TTL
+│   │   ├── errori_llm.py           # Errori del modello classificati (token, chiave, limiti) e oscuramento segreti
+│   │   ├── modelli_agenti.py       # Modello LLM per singolo agente, con ereditarietà dal padre
+│   │   ├── priorita.py             # Regole di priorità dei blocchi
+│   │   ├── risultati.py            # Esito strutturato di lettura/attuazione dei tool
+│   │   └── ruoli.py                # Ruoli di chi chiama l'API e matrice dei permessi
 │   ├── graph/
 │   │   ├── orchestrator.py         # Cervello (BrainAgent - Livello 0)
 │   │   ├── builder.py              # Builder del grafo LangGraph con wrapper HITL
-│   │   ├── hitl_config.py          # Manager della configurazione dinamica HITL
+│   │   ├── hitl_config.py          # Configurazione dinamica HITL
+│   │   ├── timer_hitl.py           # Timer di attesa dell'operatore e azione alla scadenza
 │   │   └── state.py                # GraphState condiviso
 │   ├── tools/
-│   │   ├── baseTool.py             # Classe base astratta per tutti i tool IoT/Medici
-│   │   ├── sensor_tools.py         # Tool Smart Home (AC, Serratura, Allarme)
-│   │   ├── medical_tools.py        # Tool Medici (Pacemaker, Ventilatore SpO2, Normalizzatore)
-│   │   ├── event_log.py            # Sistema Nervoso: audit log eventi e sblocco TTL
-│   │   └── tool_wrapper.py         # Tool execution logging/wrapper
+│   │   ├── baseTool.py             # Classe base astratta per i tool
+│   │   ├── sensor_tools.py         # Tool smart home simulati e registry condiviso (registra_tool)
+│   │   ├── medical_tools.py        # Tool medici (Pacemaker, Ventilatore SpO2, Normalizzatore)
+│   │   ├── event_log.py            # Sistema nervoso: audit log degli eventi e sblocchi
+│   │   └── tool_wrapper.py         # Attuazione con controllo di priorità e override
 │   ├── db/
-│   │   └── database.py             # Setup SQLite (tabelle events, readings, agents_registry)
+│   │   ├── database.py             # Schema SQLite (events, readings, ...)
+│   │   └── scenario.py             # Scenari di dati riproducibili
 │   ├── api/
-│   │   └── main.py                 # API REST FastAPI complete (100% headless con DELETE /system/reset)
-│   ├── checkpointer.py             # Checkpointer LangGraph per la persistenza
-│   └── observability/
-│       └── tracing.py              # Tracing e logging strutturato
+│   │   └── main.py                 # API REST FastAPI (grafo, streaming, HITL, agenti, tool, eventi)
+│   ├── static/
+│   │   └── demo_grafo.html         # Pagina "grafo in azione", servita su GET /demo
+│   └── checkpointer.py             # Checkpointer LangGraph persistente su SQLite
 ├── examples/
+│   ├── avvia_demo.py               # Server + scenario di prova + pagina web del grafo
+│   ├── crea_scenario.py            # Azzera un database e crea uno scenario di prova
 │   ├── hierarchical_pattern/
-│   │   └── demo_hierarchy.py       # Demo Gerarchia Smart Home N-Livelli
+│   │   └── demo_hierarchy.py       # Gerarchia smart home N-livelli da codice
 │   └── medical_homeostasis/
-│       └── demo_medical_homeostasis.py # Demo Omeostasi Fisiologica & Risoluzione Patologie
-├── tests/
-│   └── test_all.py                 # Suite di test automatizzata (38 test unitari & integrati)
+│       └── demo_medical_homeostasis.py # Omeostasi fisiologica e risoluzione di patologie
+├── scripts/
+│   └── scansione_sicurezza.sh      # Scansione di segreti e dipendenze
+├── tests/                          # Suite pytest (database temporanei, nessun LLM reale)
 └── docs/
-    └── HOW_TO_CUSTOMIZE.md         # Guida alla personalizzazione e mappatura API
+    ├── HOW_TO_CUSTOMIZE.md         # Guida alla personalizzazione e mappatura API
+    ├── PROJECT_STATUS.md           # Stato del progetto, limiti noti e roadmap
+    ├── API_SMOKE_TEST.md           # Smoke test dell'API con curl (Bash)
+    └── API_SMOKE_TEST_WINDOWS.ps1  # Smoke test dell'API per PowerShell
 ```
 
 ---
@@ -181,7 +210,7 @@ LangBrain/
 | Componente | Scelta | Perché |
 |---|---|---|
 | Framework Agenti | **LangGraph** | Grafi stateful con cicli, routing condizionale e checkpointing nativo |
-| Provider LLM | **MAO Proxy** | Supporto per OpenRouter, Google AI Studio (Gemini) e LLM Locali (vLLM, LM Studio) |
+| Provider LLM | **MAO Proxy** | OpenRouter, Google AI Studio (Gemini), Mistral e LLM locali (vLLM, LM Studio), con modello per singolo agente |
 | API Server | **FastAPI** | Server HTTP/REST asincrono 100% headless con Swagger UI interattiva |
 | Database | **SQLite (aiosqlite)** | Zero setup, persistenza audit log eventi, registro agenti e stato |
 
@@ -193,40 +222,32 @@ Le chiamate LLM sono asincrone. Il timeout HTTP del MAO è configurato da `MAO_T
 
 LangBrain tratta `action`, `old_value` e `new_value` come dati estensibili. Il boilerplate non può conoscere gli stati fisici validi di ogni dominio: chi aggiunge un tool o agente deve implementare e testare la propria validazione/mappatura (per esempio `LOCKED`/`UNLOCKED` per una serratura). I flag interni come `REJECTED` e `BLOCKED` vengono segnalati dall'health check, ma non trasformati automaticamente in uno stato fisico.
 
-Gli smoke test `smoke_test_full.ps1` e `smoke_test_full_v2.ps1` verificano prima `/v1/models`, configurano un vero interrupt sul target dell'override e usano decodifica UTF-8 esplicita su Windows PowerShell 5.1.
+Chi comanda cosa: le chiavi dell'API hanno tre ruoli (`tirocinante`, `medico_di_guardia`, `primario`) e nessun agente può attuare un dispositivo o un valore non elencato in `configurazione.toml`. Dettagli in [`docs/HOW_TO_CUSTOMIZE.md`](docs/HOW_TO_CUSTOMIZE.md) e [`SECURITY.md`](SECURITY.md).
 
 ---
 
-## 🚀 Esempi Dimostrativi Inclusi
+## 🎬 Esempi Dimostrativi Inclusi
 
-1. **Gerarchia Smart Home (`examples/hierarchical_pattern/demo_hierarchy.py`):**
+1. **Grafo in azione (`examples/avvia_demo.py`):** server con uno scenario di prova e la pagina `/demo` che mostra in tempo reale i nodi eseguiti, gli eventi, i dispositivi e la richiesta di approvazione dell'operatore.
    ```bash
-   python3 examples/hierarchical_pattern/demo_hierarchy.py
+   python examples/avvia_demo.py [--scenario conflitto_porta|base|finestra_aperta] [--modello Brain=mistral:ministral-8b-latest]
    ```
-   Dimostra l'escalation ricorsiva da un sotto-componente serratura (Livello 2) all'organo sicurezza (Livello 1) fino al Cervello (Livello 0).
+2. **Scenari di dati (`examples/crea_scenario.py`):** azzera un database e ci crea gerarchia, storico ed eventuale conflitto, per provare l'API a mano (fa prima un backup).
+3. **Gerarchia Smart Home (`examples/hierarchical_pattern/demo_hierarchy.py`):** crea da codice la gerarchia Brain → Organi → Componenti e mostra l'escalation ricorsiva dal componente serratura al Brain, che chiede l'approvazione dell'operatore.
+4. **Omeostasi medica (`examples/medical_homeostasis/demo_medical_homeostasis.py`):** tachicardia (160 BPM) e ipossia (82% SpO2): l'agente respiratorio riporta la saturazione a 95%; la tachicardia severa sale al Brain e, se la respinge, l'operatore sblocca e il protocollo ripristina 100 BPM.
 
-2. **Omeostasi Medica & Patologie (`examples/medical_homeostasis/demo_medical_homeostasis.py`):**
-   ```bash
-   python3 examples/medical_homeostasis/demo_medical_homeostasis.py
-   ```
-   Simula l'insorgenza di patologie cliniche (Tachicardia 160 BPM, Ipossia 82% SpO2) e l'intervento automatico degli Agenti Fisiologici per riportare l'organismo in omeostasi.
+Le demo 3 e 4 usano un proprio database (`demo_gerarchia.db`, `demo_medica.db`) e il provider LLM predefinito del `.env`.
 
 ---
 
-## 🧪 Esecuzione della Suite di Test
-
-Per eseguire la suite legacy custom e aggiornare `test_results.json`:
-```bash
-python3 tests/test_all.py
-```
-
-Per eseguire i test di regressione asincroni standard:
+## 🧪 Test e Controlli
 
 ```bash
-python -m unittest tests.test_blocking_regressions -v
+python -m pytest tests                 # intera suite: database temporanei, nessuna chiamata a LLM reali
+bash scripts/scansione_sicurezza.sh    # segreti e dipendenze vulnerabili (servono gitleaks e pip-audit)
 ```
 
-Per il test end-to-end con modello locale usa `smoke_test_full_v2.ps1`. Per una verifica API compatta usa lo [smoke test PowerShell per Windows](docs/API_SMOKE_TEST_WINDOWS.ps1); è disponibile anche la [versione Bash](docs/API_SMOKE_TEST.md).
+Gli stessi controlli girano in CI a ogni push (`.github/workflows/ci.yml`). Per verificare a mano un server in esecuzione: [smoke test Bash](docs/API_SMOKE_TEST.md) o [PowerShell per Windows](docs/API_SMOKE_TEST_WINDOWS.ps1) (attenzione: eseguono un reset del database del server, usali su un'istanza di prova, per esempio quella di `examples/avvia_demo.py`).
 
 ---
 

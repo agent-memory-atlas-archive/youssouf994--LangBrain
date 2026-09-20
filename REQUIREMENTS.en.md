@@ -9,7 +9,7 @@ A demonstration LangGraph boilerplate aimed at general developers and indie hack
 ## Technology Stack
 
 - **Agent Framework**: LangGraph
-- **API Server**: FastAPI (with REST/WebSocket streaming support)
+- **API Server**: FastAPI (graph streaming with Server-Sent Events; WebSocket not implemented)
 - **Database**: SQLite for the boilerplate (schema easily migrated to Postgres)
 - **Containerization**: Docker & Docker Compose
 
@@ -85,44 +85,70 @@ Unregistered devices are automatically created as an `IoTDeviceTool` with an `OF
 
 ```text
 LangBrain/
-├── REQUIREMENTS.md
+├── README.md / README.en.md
+├── REQUIREMENTS.md / REQUIREMENTS.en.md
+├── SECURITY.md                     # How to report vulnerabilities and what to expect from security
+├── CONTRIBUTING.md                 # How to contribute
+├── LICENCE
 ├── Dockerfile
 ├── docker-compose.yml
-├── requirements.txt
-├── test_results.json               # Real-time result of the test suite
-├── .env                            # LLM provider and Brain prompts configuration
-├── .env.example                    # Template configuration file (no secrets)
+├── requirements.txt                # Direct dependencies, exact versions
+├── requirements.lock               # Full pinned list (used by the Dockerfile)
+├── requirements-dev.txt            # Plus pytest
+├── .env.example                    # Secrets template (provider and API keys); your .env stays out of Git
+├── configurazione.toml             # User choices: devices and allowed values, LLM providers, HITL and timer
+├── run_loop.py                     # Event-driven loop with a sensor event producer
+├── .github/workflows/ci.yml        # CI: tests on Python 3.12/3.14, secrets and dependency scan
 ├── app/
 │   ├── MAO/
-│   │   └── model_access_object.py  # MAO (Model Access Object for local/OpenAI-compatible LLMs)
+│   │   └── model_access_object.py  # Model Access Object (OpenRouter, Google AI Studio, Mistral, local LLM)
 │   ├── agents/
-│   │   ├── base_agent.py           # Abstract base class for sub-agents
-│   │   ├── agent_climate.py        # Native Climate sub-agent
-│   │   ├── dynamic_agent.py        # Configurable N-Level Dynamic Agent
-│   │   ├── agent_registry.py       # Hierarchical registry persisted in SQLite
+│   │   ├── base_agent.py           # Common DNA of every agent (apply state, priority, escalation)
+│   │   ├── agent_climate.py        # Native Climate agent
+│   │   ├── dynamic_agent.py        # Runtime-configurable dynamic agent (Levels 1..N)
+│   │   ├── agent_registry.py       # Hierarchical registry on SQLite
 │   │   └── medical_agents.py       # Physiological agents (Cardiovascular, Respiratory)
+│   ├── core/
+│   │   ├── configurazione.py       # Reads and validates configurazione.toml
+│   │   ├── constants.py            # Control flags and TTL
+│   │   ├── errori_llm.py           # Classified model errors (tokens, key, limits) and secret masking
+│   │   ├── modelli_agenti.py       # Per-agent LLM model, inherited from the parent
+│   │   ├── priorita.py             # Priority rules for locks
+│   │   ├── risultati.py            # Structured result of tool reads/commands
+│   │   └── ruoli.py                # Roles of API callers and the permission matrix
 │   ├── graph/
 │   │   ├── orchestrator.py         # Brain (BrainAgent - Level 0)
 │   │   ├── builder.py              # LangGraph builder with HITL wrapper
-│   │   ├── hitl_config.py          # Dynamic HITL configuration manager
+│   │   ├── hitl_config.py          # Dynamic HITL configuration
+│   │   ├── timer_hitl.py           # Operator wait timer and action on expiry
 │   │   └── state.py                # Shared GraphState
 │   ├── tools/
 │   │   ├── baseTool.py             # Abstract base class for tools
-│   │   ├── tool_wrapper.py         # execute_tool_safely (priority checks) + force_execute_tool (Override)
-│   │   ├── event_log.py            # log_event(), mark_resolved(), unblock_target()
-│   │   ├── sensor_tools.py         # Mock tools for IoT sensors/actuators (on-demand singleton)
-│   │   └── medical_tools.py        # Medical tools (Pacemaker, SpO2, Normalizer)
+│   │   ├── sensor_tools.py         # Simulated smart home tools and shared registry (registra_tool)
+│   │   ├── medical_tools.py        # Medical tools (Pacemaker, SpO2 ventilator, Normalizer)
+│   │   ├── event_log.py            # Nervous system: event audit log and unblocks
+│   │   └── tool_wrapper.py         # Actuation with priority check and override
 │   ├── db/
-│   │   └── database.py             # SQLite setup (tabelle events, readings, agents_registry)
+│   │   ├── database.py             # SQLite schema (events, readings, ...)
+│   │   └── scenario.py             # Reproducible data scenarios
 │   ├── api/
-│   │   └── main.py                 # FastAPI (REST + RunCycleRequest con thread_id + HITL config)
-│   └── observability/
-│       └── tracing.py              # Logging strutturato / tracing
+│   │   └── main.py                 # FastAPI REST API (graph, streaming, HITL, agents, tools, events)
+│   ├── static/
+│   │   └── demo_grafo.html         # "Graph in action" page, served on GET /demo
+│   └── checkpointer.py             # Persistent LangGraph checkpointer on SQLite
 ├── examples/
+│   ├── avvia_demo.py               # Server + sample scenario + graph web page
+│   ├── crea_scenario.py            # Resets a database and creates a sample scenario
 │   ├── hierarchical_pattern/
-│   │   └── demo_hierarchy.py       # Smart Home Hierarchy Demo (N-levels)
+│   │   └── demo_hierarchy.py       # N-level smart home hierarchy from code
 │   └── medical_homeostasis/
-│       └── demo_medical_homeostasis.py # Medical homeostasis demo
+│       └── demo_medical_homeostasis.py # Physiological homeostasis and pathology resolution
+├── scripts/
+│   └── scansione_sicurezza.sh      # Secrets and dependency scan
+├── tests/                          # pytest suite (temporary databases, no real LLM)
 └── docs/
-    └── HOW_TO_CUSTOMIZE.md
+    ├── HOW_TO_CUSTOMIZE.md         # Customization guide and API map
+    ├── PROJECT_STATUS.md           # Project status, known limits and roadmap
+    ├── API_SMOKE_TEST.md           # API smoke test with curl (Bash)
+    └── API_SMOKE_TEST_WINDOWS.ps1  # API smoke test for PowerShell
 ```

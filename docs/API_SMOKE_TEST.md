@@ -2,6 +2,8 @@
 
 Questo script crea una gerarchia `Brain → organ_security → component_door_lock/component_alarm` e verifica i tre bug corretti: caricamento degli eventi DB nel percorso del grafo, routing case-insensitive e propagazione ricorsiva delle escalation. Copre inoltre registry, gerarchia, tool, audit log, unblock, HITL, stato/checkpoint, health check opzionale, proxy LLM opzionale, eliminazione agenti e reset.
 
+Se `API_KEY` è impostata nel `.env` del server, esportala anche nella shell dello script: viene inviata come header `X-API-Key`.
+
 Prerequisiti: server avviato dalla root con `python -m uvicorn app.api.main:app --reload`, `curl`, `jq` e almeno un provider LLM configurato per i cicli degli agenti. Il timeout MAO è configurabile con `MAO_TIMEOUT_SECONDS` e vale 40 secondi per default. Imposta `RUN_LLM_TESTS=1` per includere le chiamate LLM esplicite, che possono consumare quota o risorse del modello locale.
 
 ```bash
@@ -18,12 +20,14 @@ request() {
   if [[ -n "$body" ]]; then
     curl --fail-with-body --silent --show-error \
       --request "$method" \
+      ${API_KEY:+--header "X-API-Key: $API_KEY"} \
       --header "Content-Type: application/json" \
       --data "$body" \
       "$API_URL$path" | jq .
   else
     curl --fail-with-body --silent --show-error \
       --request "$method" \
+      ${API_KEY:+--header "X-API-Key: $API_KEY"} \
       "$API_URL$path" | jq .
   fi
 }
@@ -38,7 +42,7 @@ request GET /
 request DELETE /system/reset
 
 printf '=== 2. Creazione gerarchia N-livelli ===\n'
-create_agent "$(jq -cn '{name:"organ_security",level:1,parent_agent_name:"Brain",managed_targets:["front_door_lock","alarm_system"],sub_agent_names:["component_door_lock","component_alarm"],system_prompt_template:"Gestisci la sicurezza. Rispondi DECISIONE: NONE se non ci sono anomalie.",priority_weight:500.0}')"
+create_agent "$(jq -cn '{name:"organ_security",level:1,parent_agent_name:"Brain",managed_targets:["front_door_lock","alarm_system"],system_prompt_template:"Gestisci la sicurezza. Rispondi DECISIONE: NONE se non ci sono anomalie.",priority_weight:500.0}')"
 create_agent "$(jq -cn '{name:"component_door_lock",level:2,parent_agent_name:"organ_security",managed_targets:["front_door_lock"],sub_agent_names:[],system_prompt_template:"Controlla la serratura. Rispondi nel formato DECISIONE: [ACTION|ESCALATE|NONE].",priority_weight:200.0}')"
 create_agent "$(jq -cn '{name:"component_alarm",level:2,parent_agent_name:"organ_security",managed_targets:["alarm_system"],sub_agent_names:[],system_prompt_template:"Controlla l allarme. Rispondi nel formato DECISIONE: [ACTION|ESCALATE|NONE].",priority_weight:200.0}')"
 request GET /agents

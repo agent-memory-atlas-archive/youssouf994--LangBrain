@@ -7,7 +7,7 @@ Boilerplate LangGraph dimostrativo rivolto a dev/indie hacker generici. Mostra u
 
 ## Stack Tecnologico
 - **Framework Agenti**: LangGraph
-- **API Server**: FastAPI (con supporto streaming REST/WebSocket)
+- **API Server**: FastAPI (streaming del grafo con Server-Sent Events; WebSocket non implementato)
 - **Database**: SQLite per il boilerplate (schema facilmente migrabile a Postgres)
 - **Containerizzazione**: Docker & Docker Compose
 
@@ -55,7 +55,7 @@ I dispositivi non pre-registrati vengono creati automaticamente come `IoTDeviceT
 
 Nota operativa (2026-09-04):
 - È stata aggiunta una variabile di ambiente di sviluppo `MAO_ENABLE_MOCK` (valore `1`) che abilita una risposta mock del MAO per test locali senza credenziali LLM.
-- Il progetto include ora un checkpointer persistente in-process (file-backed InMemorySaver) in `app/checkpointer.py`. Questo riduce la perdita di stato su ricompilazioni in-process ma non sostituisce una soluzione persistente cross-process come Postgres/Redis.
+- Il progetto include un checkpointer persistente su SQLite (`AsyncSqliteSaver`) in `app/checkpointer.py`, sullo stesso file del DB applicativo (tabelle `checkpoints` e `writes`). Thread e interrupt HITL pendenti sopravvivono a riavvii e ricompilazioni; per un deployment multi-worker resta necessario un backend condiviso come Postgres/Redis.
 - `LOCAL_MODEL_BASE_URL` configura l'accesso locale; `LOCAL_MODEL_DOCKER_BASE_URL` configura l'endpoint visto dal container. Su una macchina LAN possono coincidere.
 - `LOCAL_MODEL` deve corrispondere esattamente a un ID restituito dall'endpoint OpenAI-compatible `/v1/models`.
 - La semantica e la normalizzazione di `action`, `old_value` e `new_value` sono contratti del dominio applicativo. Ogni sviluppatore deve validare i valori ammessi nel proprio tool/agente; il core non converte automaticamente azioni simboliche in stati fisici.
@@ -80,45 +80,71 @@ Nota operativa (2026-09-04):
 
 ```text
 LangBrain/
-├── REQUIREMENTS.md
+├── README.md / README.en.md
+├── REQUIREMENTS.md / REQUIREMENTS.en.md
+├── SECURITY.md                     # Come segnalare vulnerabilità e cosa aspettarsi dalla sicurezza
+├── CONTRIBUTING.md                 # Come contribuire
+├── LICENCE
 ├── Dockerfile
 ├── docker-compose.yml
-├── requirements.txt
-├── test_results.json               # Esito in tempo reale della suite di test
-├── .env                            # Provider LLM e Prompt configurabili del Brain
-├── .env.example                    # Template di configurazione senza segreti
+├── requirements.txt                # Dipendenze dirette, versioni esatte
+├── requirements.lock               # Elenco completo fissato (usato dal Dockerfile)
+├── requirements-dev.txt            # In più pytest
+├── .env.example                    # Template dei segreti (chiavi dei provider e dell'API); il tuo .env resta fuori da Git
+├── configurazione.toml             # Scelte dell'utente: dispositivi e valori ammessi, provider LLM, HITL e timer
+├── run_loop.py                     # Loop event-driven con produttore di eventi dei sensori
+├── .github/workflows/ci.yml        # CI: test su Python 3.12/3.14, scansione segreti e dipendenze
 ├── app/
 │   ├── MAO/
-│   │   └── model_access_object.py  # Mao (Model Access Object per LLM locale/OpenAI API)
+│   │   └── model_access_object.py  # Model Access Object (OpenRouter, Google AI Studio, Mistral, LLM locale)
 │   ├── agents/
-│   │   ├── base_agent.py           # Classe base astratta per sotto-agenti
-│   │   ├── agent_climate.py        # Sotto-agente Clima nativo
-│   │   ├── dynamic_agent.py        # Agente Dinamico Livello N configurabile
-│   │   ├── agent_registry.py       # Registro gerarchico salvato su DB SQLite
-│   │   └── medical_agents.py       # Agenti Fisiologici (Cardiovascolare, Respiratorio)
+│   │   ├── base_agent.py           # DNA comune di ogni agente (applica stato, priorità, escalation)
+│   │   ├── agent_climate.py        # Agente Clima nativo
+│   │   ├── dynamic_agent.py        # Agente dinamico configurabile a runtime (Livelli 1..N)
+│   │   ├── agent_registry.py       # Registro gerarchico su SQLite
+│   │   └── medical_agents.py       # Agenti fisiologici (Cardiovascolare, Respiratorio)
+│   ├── core/
+│   │   ├── configurazione.py       # Lettura e validazione di configurazione.toml
+│   │   ├── constants.py            # Flag di controllo e TTL
+│   │   ├── errori_llm.py           # Errori del modello classificati (token, chiave, limiti) e oscuramento segreti
+│   │   ├── modelli_agenti.py       # Modello LLM per singolo agente, con ereditarietà dal padre
+│   │   ├── priorita.py             # Regole di priorità dei blocchi
+│   │   ├── risultati.py            # Esito strutturato di lettura/attuazione dei tool
+│   │   └── ruoli.py                # Ruoli di chi chiama l'API e matrice dei permessi
 │   ├── graph/
 │   │   ├── orchestrator.py         # Cervello (BrainAgent - Livello 0)
 │   │   ├── builder.py              # Builder del grafo LangGraph con wrapper HITL
-│   │   ├── hitl_config.py          # Manager della configurazione dinamica HITL
+│   │   ├── hitl_config.py          # Configurazione dinamica HITL
+│   │   ├── timer_hitl.py           # Timer di attesa dell'operatore e azione alla scadenza
 │   │   └── state.py                # GraphState condiviso
 │   ├── tools/
 │   │   ├── baseTool.py             # Classe base astratta per i tool
-│   │   ├── tool_wrapper.py         # execute_tool_safely (controllo priorità) + force_execute_tool (God Mode Override)
-│   │   ├── event_log.py            # log_event(), mark_resolved(), unblock_target()
-│   │   ├── sensor_tools.py         # Tool mock per sensori/attuatori IoT (creazione on-demand singleton)
-│   │   └── medical_tools.py        # Tool medici (Pacemaker, SpO2, Normalizzatore)
+│   │   ├── sensor_tools.py         # Tool smart home simulati e registry condiviso (registra_tool)
+│   │   ├── medical_tools.py        # Tool medici (Pacemaker, Ventilatore SpO2, Normalizzatore)
+│   │   ├── event_log.py            # Sistema nervoso: audit log degli eventi e sblocchi
+│   │   └── tool_wrapper.py         # Attuazione con controllo di priorità e override
 │   ├── db/
-│   │   └── database.py             # SQLite setup (tabelle events, readings, agents_registry)
+│   │   ├── database.py             # Schema SQLite (events, readings, ...)
+│   │   └── scenario.py             # Scenari di dati riproducibili
 │   ├── api/
-│   │   └── main.py                 # FastAPI (REST + RunCycleRequest con thread_id + HITL config)
-│   └── observability/
-│       └── tracing.py              # Logging strutturato / tracing
+│   │   └── main.py                 # API REST FastAPI (grafo, streaming, HITL, agenti, tool, eventi)
+│   ├── static/
+│   │   └── demo_grafo.html         # Pagina "grafo in azione", servita su GET /demo
+│   └── checkpointer.py             # Checkpointer LangGraph persistente su SQLite
 ├── examples/
+│   ├── avvia_demo.py               # Server + scenario di prova + pagina web del grafo
+│   ├── crea_scenario.py            # Azzera un database e crea uno scenario di prova
 │   ├── hierarchical_pattern/
-│   │   └── demo_hierarchy.py       # Demo Gerarchia Smart Home N-Livelli
+│   │   └── demo_hierarchy.py       # Gerarchia smart home N-livelli da codice
 │   └── medical_homeostasis/
-│       └── demo_medical_homeostasis.py # Demo Omeostasi Fisiologica Medica
+│       └── demo_medical_homeostasis.py # Omeostasi fisiologica e risoluzione di patologie
+├── scripts/
+│   └── scansione_sicurezza.sh      # Scansione di segreti e dipendenze
+├── tests/                          # Suite pytest (database temporanei, nessun LLM reale)
 └── docs/
-    └── HOW_TO_CUSTOMIZE.md
+    ├── HOW_TO_CUSTOMIZE.md         # Guida alla personalizzazione e mappatura API
+    ├── PROJECT_STATUS.md           # Stato del progetto, limiti noti e roadmap
+    ├── API_SMOKE_TEST.md           # Smoke test dell'API con curl (Bash)
+    └── API_SMOKE_TEST_WINDOWS.ps1  # Smoke test dell'API per PowerShell
 ```
 

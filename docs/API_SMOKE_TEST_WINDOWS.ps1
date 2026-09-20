@@ -19,6 +19,8 @@ function Invoke-LangBrainApi {
         Method = $Method
         Uri = "$ApiUrl$Path"
     }
+    # Se API_KEY è definita, ogni chiamata invia l'header X-API-Key.
+    if ($env:API_KEY) { $parameters.Headers = @{ "X-API-Key" = $env:API_KEY } }
     if ($null -ne $Body) {
         $parameters.ContentType = "application/json; charset=utf-8"
         $json = $Body | ConvertTo-Json -Depth 20 -Compress

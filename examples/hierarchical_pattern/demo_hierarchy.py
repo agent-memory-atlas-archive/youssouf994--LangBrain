@@ -12,14 +12,19 @@ Struttura di questo test:
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
+# Database dedicato alla demo: i tuoi dati non vengono toccati. Va impostato prima di importare l'applicazione.
+os.environ.setdefault("DB_PATH", str(ROOT / "demo_gerarchia.db"))
+
 from app.agents.agent_registry import AgentRegistry
-from app.db.database import Database
+from app.db.database import DB_PATH
+from app.db.scenario import crea_scenario
 from app.graph.builder import build_graph
 from app.tools.event_log import EventLog
 
@@ -30,14 +35,16 @@ logger = logging.getLogger("demo_hierarchy")
 async def main():
     logger.info("=== AVVIO DEMO GERARCHIA: Cervello -> Organi -> Componenti ===")
 
-    # 1. Inizializza DB e Registry
-    db = Database()
-    await db.init_db()
+    # 1. Database della demo azzerato a ogni esecuzione, poi registro degli agenti
+    await crea_scenario(DB_PATH, "vuoto")
 
     registry = AgentRegistry()
     await registry.init_registry_db()
 
-    # 2. Configura Organo 1 (gestisce 2 tool diretti)
+    # 2. Configura Organo 1 (gestisce 2 tool diretti).
+    #    Il registro semina 'agent_climate' sugli stessi target: due rami diversi non possono
+    #    gestire lo stesso dispositivo, quindi il seme viene rimosso prima di registrare 'organ_climate'.
+    await registry.delete_agent("agent_climate")
     await registry.register_agent_config({
         "name": "organ_climate",
         "level": 1,
@@ -48,13 +55,14 @@ async def main():
         "priority_weight": 1.0,
     })
 
-    # 3. Configura Organo 2 (gestisce 2 sotto-agenti/componenti)
+    # 3. Configura Organo 2 (coordina 2 componenti). I figli non si elencano qui: sono derivati
+    #    dal 'parent_agent_name' dei componenti, registrati subito dopo (creazione dall'alto verso il basso).
     await registry.register_agent_config({
         "name": "organ_security",
         "level": 1,
         "parent_agent_name": "Brain",
         "managed_targets": ["front_door_lock", "alarm_system"],
-        "sub_agent_names": ["component_door_lock", "component_alarm"],
+        "sub_agent_names": [],
         "system_prompt_template": "Sei l'Organo di Sicurezza (Livello 1). Coordini i componenti serratura ed allarme.",
         "priority_weight": 500.0,
     })
@@ -112,11 +120,11 @@ async def main():
     event_log = EventLog()
     await event_log.log_event(
         actor="user_manual",
-        action="MANUAL_UNLOCK_OVERRIDE",
+        action="SECURITY_LOCK",
         target="front_door_lock",
         old_value="LOCKED",
-        new_value="UNLOCKED",
-        reasoning="Sblocco manuale d'emergenza",
+        new_value="LOCKED",
+        reasoning="Blocco manuale della porta: verifica in corso",
         escalated=False,
     )
 
@@ -134,6 +142,10 @@ async def main():
     messages2 = result2.get("messages", [])
     if messages2:
         logger.info("Esito Ciclo 2 (Escalation Componente -> Organo -> Brain): %s", messages2[-1].content)
+
+    istantanea = await graph.aget_state(thread_config)
+    if any(task.interrupts for task in istantanea.tasks):
+        logger.info("Il Brain ha chiesto l'approvazione dell'operatore (HITL): il grafo è in pausa. Con l'API si riprende con POST /graph/resume.")
 
     logger.info("=== DEMO GERARCHIA COMPLETATA CON SUCCESSO ===")
 
