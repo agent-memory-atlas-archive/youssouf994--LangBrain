@@ -32,3 +32,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 Desktop.ini
+# SQLite in modalità WAL (checkpointer)
+*.db-wal
+*.db-shm

@@ -1,938 +1,687 @@
 """
-Test suite completa — LangBrain
-Risultati scritti in: test_results.json
+Regressione generale di LangBrain.
+
+Ogni controllo è un test pytest a sé, isolato dagli altri: database SQLite temporaneo con lo schema creato,
+registro dei tool ripulito a ogni test, nessuna chiamata reale a un LLM. Una prova con un modello vero è
+disponibile ma disattivata: `RUN_LLM_TESTS=1 python -m pytest tests/test_all.py -k reale`.
+
+Le aree sono le stesse dello script precedente (utilità, database, tool IoT, MAO, agenti, builder, API, TTL, HITL,
+gerarchia, agenti medici, override); le funzionalità più recenti hanno i propri file di test.
 """
 
 import asyncio
 import json
+import os
+import sqlite3
 import sys
-import time
-import traceback
-from datetime import datetime, timezone
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
-# Assicura che la root del progetto sia nel path
-ROOT = Path(__file__).parent.parent
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-results: list[dict] = []
+from fastapi import HTTPException
+
+from app.agents.agent_climate import ClimateAgent
+from app.agents.agent_registry import AgentRegistry
+from app.agents.base_agent import BaseAgent
+from app.agents.dynamic_agent import DynamicAgent
+from app.agents.medical_agents import CardiovascularOrganAgent, RespiratoryOrganAgent
+from app.core.configurazione import costruisci_configurazione, imposta_configurazione
+from app.core.constants import is_control_flag, is_flag_expired
+from app.core.errori_llm import ErroreLLM
+from app.db.database import Database
+from app.graph.builder import build_graph, wrap_node_with_hitl
+from app.graph.hitl_config import hitl_manager
+from app.graph.orchestrator import BrainAgent
+from app.MAO.model_access_object import Mao
+from app.tools import sensor_tools
+from app.tools.event_log import EventLog
+from app.tools.medical_tools import HeartRateRegulatorTool, LungVentilatorTool, deterministic_biometric_normalizer
+from app.tools.sensor_tools import IoTDeviceTool, get_default_iot_tools, get_tool
+from app.tools.tool_wrapper import force_execute_tool
 
 
-def record(name: str, passed: bool, detail: str = "", duration_ms: float = 0.0):
-    results.append({
-        "test": name,
-        "passed": passed,
-        "detail": detail[:600],
-        "duration_ms": round(duration_ms, 1),
-        "ts": datetime.now(timezone.utc).isoformat(),
-    })
-    status = "✓" if passed else "✗"
-    print(f"  {status} {name}" + (f" — {detail[:120]}" if not passed else ""))
+class BaseTest(unittest.IsolatedAsyncioTestCase):
+    """Ambiente isolato: database temporaneo con lo schema, registro dei tool vuoto, HITL azzerato."""
+
+    async def asyncSetUp(self):
+        self._cartella = tempfile.TemporaryDirectory()
+        self.addCleanup(self._cartella.cleanup)
+        self.db = os.path.join(self._cartella.name, "test.db")
+        await Database(self.db).init_db()
+
+        self.enterContext(patch.dict(sensor_tools._TOOL_REGISTRY, {}, clear=True))
+        self._azzera_hitl()
+        self.addCleanup(self._azzera_hitl)
+
+    @staticmethod
+    def _azzera_hitl():
+        hitl_manager.update_config(hitl_all=False, hitl_nodes=[], hitl_targets=[], hitl_actions=[], max_wait_seconds=None)
+
+    def log(self, **kwargs) -> EventLog:
+        return EventLog(db_path=self.db, **kwargs)
+
+    def usa_db(self, agente):
+        """Fa scrivere l'agente sul database temporaneo del test invece che su quello predefinito."""
+        agente.event_log.db_path = self.db
+        return agente
+
+    def righe(self, sql, *parametri):
+        with sqlite3.connect(self.db) as db:
+            return db.execute(sql, parametri).fetchall()
 
 
-def run(coro):
-    return asyncio.run(coro)
+STATO_BASE = {
+    "messages": [], "readings": [], "recent_events": [], "pending_escalations": [],
+    "next_agent": "brain", "hitl_required": False, "config": {},
+}
 
 
-async def timed_async(coro):
-    t0 = time.perf_counter()
-    result = await coro
-    return result, (time.perf_counter() - t0) * 1000
+# ── 1. Utilità ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 
-def timed_sync(fn, *args, **kwargs):
-    t0 = time.perf_counter()
-    result = fn(*args, **kwargs)
-    return result, (time.perf_counter() - t0) * 1000
+class UtilitaTest(unittest.TestCase):
+    def test_is_control_flag(self):
+        casi = [
+            ("REJECTED", True), ("RECONCILED_foo", True), ("RESOLVED_bar", True), ("ESCALATION_baz", True),
+            ("BLOCKED", True), ("rejected_lower", True), ("TOOL_ERROR_TURN_ON", True), ("INVALID_COMMAND_X", True),
+            ("22.5°C", False), ("OFF", False), ("LOCKED", False), ("DISARMED", False), ("", False),
+        ]
+        sbagliati = [(valore, atteso) for valore, atteso in casi if is_control_flag(valore) != atteso]
+        self.assertEqual(sbagliati, [])
+
+    def test_filtro_dei_flag_di_controllo_per_l_event_producer(self):
+        bloccati = ["REJECTED", "RECONCILED_ACT", "RESOLVED_ESC", "ESCALATION_PROP", "BLOCKED"]
+        fisici = ["22.5°C", "OFF", "LOCKED", "DISARMED", "0", "100%"]
+        self.assertTrue(all(is_control_flag(v) for v in bloccati))
+        self.assertFalse(any(is_control_flag(v) for v in fisici))
 
 
-# ── SEZIONE 1: Core Utilities ──────────────────────────────────────────────
-print("\n[1] Core Utilities")
-
-try:
-    from app.core.constants import is_control_flag
-    cases = [
-        ("REJECTED", True), ("RECONCILED_foo", True), ("RESOLVED_bar", True),
-        ("ESCALATION_baz", True), ("BLOCKED", True),
-        ("22.5°C", False), ("OFF", False), ("LOCKED", False), ("DISARMED", False),
-        ("", False), ("rejected_lower", True),
-    ]
-    failed_cases = [(v, e) for v, e in cases if is_control_flag(v) != e]
-    if failed_cases:
-        record("is_control_flag", False, str(failed_cases))
-    else:
-        record("is_control_flag", True)
-except Exception as e:
-    record("is_control_flag", False, traceback.format_exc(limit=2))
+# ── 2. Database ────────────────────────────────────────────────────────────────────────────────────────────────
 
 
-# ── SEZIONE 2: Database ────────────────────────────────────────────────────
-print("\n[2] Database")
+class DatabaseTest(BaseTest):
+    async def test_init_db_crea_le_tabelle_e_l_indice(self):
+        tabelle = {r[0] for r in self.righe("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        indici = {r[0] for r in self.righe("SELECT name FROM sqlite_master WHERE type = 'index'")}
+        self.assertTrue({"events", "readings"} <= tabelle)
+        self.assertIn("idx_events_target_ts", indici)
 
-try:
-    from app.db.database import Database, DB_PATH
-    db_mem = Database(db_path=":memory:")
-    run(db_mem.init_db())
-    record("db.init_db_memory", True)
-except Exception as e:
-    record("db.init_db_memory", False, str(e))
+    async def test_init_db_e_idempotente_e_non_semina_dati_di_prova_per_default(self):
+        await Database(self.db).init_db()
+        self.assertEqual(self.righe("SELECT COUNT(*) FROM events"), [(0,)])
 
-try:
-    from app.tools.event_log import EventLog
+    async def test_il_conflitto_dimostrativo_si_semina_solo_se_richiesto_e_non_si_accumula(self):
+        imposta_configurazione(costruisci_configurazione({"demo": {"conflitto_all_avvio": 1}}))
+        self.addCleanup(imposta_configurazione, None)
 
-    async def _test_log_read():
-        log = EventLog(target=["all"], frequency=240, db_path=DB_PATH)
+        await Database(self.db).init_db()
+        await Database(self.db).init_db()
+
+        self.assertEqual(self.righe("SELECT actor, action, target FROM events"), [("agent_security", "FORCE_SHUTDOWN", "ac_living_room")])
+
+    async def test_un_database_con_lo_schema_vecchio_viene_migrato(self):
+        vecchio = os.path.join(self._cartella.name, "vecchio.db")
+        with sqlite3.connect(vecchio) as db:
+            db.execute("""CREATE TABLE events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT NOT NULL, action TEXT NOT NULL,
+                          target TEXT NOT NULL, reasoning TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, escalated BOOLEAN DEFAULT 0)""")
+
+        await Database(vecchio).init_db()
+
+        with sqlite3.connect(vecchio) as db:
+            colonne = {r[1] for r in db.execute("PRAGMA table_info(events)")}
+        self.assertTrue({"old_value", "new_value"} <= colonne)
+
+    async def test_registrazione_e_lettura_degli_eventi(self):
+        log = self.log(target=["all"], frequency=240)
         await log.log_event("test_actor", "TEST_ACTION", "ac_living_room", "OFF", "ON", "test", False)
-        events = await log.get_recent_events()
-        assert any(e["actor"] == "test_actor" for e in events), "evento test non trovato"
-        return True
 
-    res, ms = run(timed_async(_test_log_read()))
-    record("event_log.log_and_read", res, duration_ms=ms)
-except Exception as e:
-    record("event_log.log_and_read", False, traceback.format_exc(limit=2))
+        eventi = await log.get_recent_events()
 
-try:
-    async def _test_mark_resolved():
-        log = EventLog(target=["all"], frequency=240, db_path=DB_PATH)
+        self.assertTrue(any(e["actor"] == "test_actor" and e["old_value"] == "OFF" and e["new_value"] == "ON" for e in eventi))
+
+    async def test_mark_resolved_chiude_le_escalation_del_target(self):
+        log = self.log(target=["all"], frequency=240)
         await log.log_event("agent_climate", "ESCALATION_PROPOSED", "heater_bedroom", "OFF", "22.5°C", "test", True)
+
         await log.mark_resolved("heater_bedroom")
-        events = await log.get_recent_events()
-        still_open = [e for e in events
-                      if e.get("action") == "ESCALATION_PROPOSED" and e.get("target") == "heater_bedroom"]
-        assert len(still_open) == 0, f"{len(still_open)} ESCALATION_PROPOSED ancora aperte"
-        return True
 
-    res, ms = run(timed_async(_test_mark_resolved()))
-    record("event_log.mark_resolved", res, duration_ms=ms)
-except Exception as e:
-    record("event_log.mark_resolved", False, traceback.format_exc(limit=2))
+        aperte = [e for e in await log.get_recent_events() if e["action"] == "ESCALATION_PROPOSED" and e["target"] == "heater_bedroom"]
+        self.assertEqual(aperte, [])
+
+    async def test_mark_resolved_chiude_anche_le_escalation_con_un_nome_di_azione_personalizzato(self):
+        log = self.log(target=["all"], frequency=240)
+        await log.log_event("organ_cardiovascular", "CRITICAL_ARHYTHMIA_ESCALATION", "cardiac_pacemaker", "160 BPM", "100 BPM", "x", True)
+        await log.log_event("organ_cardiovascular", "CRITICAL_ARHYTHMIA_ESCALATION", "oxygen_regulator", "82", "95", "x", True)
+
+        await log.mark_resolved("cardiac_pacemaker")
+
+        azioni = {(e["target"], e["action"], e["escalated"]) for e in await log.get_recent_events()}
+        self.assertIn(("cardiac_pacemaker", "RESOLVED_CRITICAL_ARHYTHMIA_ESCALATION", 0), azioni)
+        self.assertIn(("oxygen_regulator", "CRITICAL_ARHYTHMIA_ESCALATION", 1), azioni)  # altri target: invariati
+
+    async def test_mark_resolved_non_riscrive_un_evento_gia_risolto(self):
+        log = self.log(target=["all"], frequency=240)
+        await log.log_event("a", "RESOLVED_ESCALATION_PROPOSED", "x_dev", "1", "2", "r", True)
+
+        await log.mark_resolved("x_dev")
+
+        self.assertEqual([e["action"] for e in await log.get_recent_events()], ["RESOLVED_ESCALATION_PROPOSED"])
+
+    async def test_gli_eventi_di_un_altro_target_non_vengono_letti(self):
+        await self.log().log_event("x", "A", "front_door_lock", "1", "2", "r")
+        self.assertEqual(await self.log(target=["heater_bedroom"], frequency=240).get_recent_events(), [])
 
 
-# ── SEZIONE 3: Tool IoT (Singleton) ───────────────────────────────────────
-print("\n[3] IoT Tools")
+# ── 3. Tool IoT ────────────────────────────────────────────────────────────────────────────────────────────────
 
-try:
-    from app.tools.sensor_tools import get_default_iot_tools, get_tool, _TOOL_REGISTRY
-    t1 = get_default_iot_tools()
-    t2 = get_default_iot_tools()
-    assert t1["ac_living_room"] is t2["ac_living_room"], "singleton violato"
-    record("sensor_tools.singleton", True)
-except Exception as e:
-    record("sensor_tools.singleton", False, str(e))
 
-try:
-    async def _test_tool_rw():
+class ToolIotTest(BaseTest):
+    async def test_i_tool_predefiniti_sono_singleton(self):
+        self.assertIs(get_default_iot_tools()["ac_living_room"], get_default_iot_tools()["ac_living_room"])
+
+    async def test_lettura_e_scrittura(self):
         tool = get_tool("ac_living_room")
         await tool.set_tool_value("OFF")
-        assert await tool.get_tool_value() == "OFF"
+        self.assertEqual(await tool.get_tool_value(), "OFF")
         await tool.set_tool_value("22.5°C")
-        assert await tool.get_tool_value() == "22.5°C"
-        return True
+        self.assertEqual(await tool.get_tool_value(), "22.5°C")
 
-    res, ms = run(timed_async(_test_tool_rw()))
-    record("sensor_tools.get_set", res, duration_ms=ms)
-except Exception as e:
-    record("sensor_tools.get_set", False, str(e))
-
-try:
-    async def _test_no_unit_dup():
+    async def test_l_unita_non_si_duplica(self):
         tool = get_tool("ac_living_room")
         await tool.set_tool_value("22.5°C")
-        v = str(await tool.get_tool_value())
-        assert "°C°C" not in v, f"doppia unità: {v}"
-        return True
+        self.assertNotIn("°C°C", str(await tool.get_tool_value()))
 
-    res, ms = run(timed_async(_test_no_unit_dup()))
-    record("sensor_tools.no_double_unit", res, duration_ms=ms)
-except Exception as e:
-    record("sensor_tools.no_double_unit", False, str(e))
+    async def test_un_tool_creato_on_demand_e_lo_stesso_oggetto_alla_richiesta_successiva(self):
+        primo = get_tool("dispositivo_on_demand", initial_value="IDLE", unit="status")
+        self.assertEqual(await primo.get_tool_value(), "IDLE")
+        await primo.set_tool_value("ACTIVE")
+        self.assertEqual(await get_tool("dispositivo_on_demand").get_tool_value(), "ACTIVE")
 
-
-# ── SEZIONE 4: MAO ────────────────────────────────────────────────────────
-print("\n[4] MAO")
-
-mao = None
-try:
-    from app.MAO.model_access_object import Mao
-    mao = Mao()
-    assert mao.default_provider == "openrouter", f"provider={mao.default_provider}"
-    assert all(k in mao.providers for k in ("openrouter", "google_studio", "local"))
-    record("mao.init_providers", True)
-except Exception as e:
-    record("mao.init_providers", False, str(e))
-
-try:
-    assert mao is not None
-    try:
-        _, ms = run(timed_async(mao.call_model("Rispondi solo con OK.", "Test connessione.", max_tokens=10)))
-        record("mao.call_model_live", True, duration_ms=ms)
-    except Exception as ex:
-        # Se i provider esterni falliscono per mancanza di crediti o connettività, valida che il fallback gestisca l'eccezione
-        record("mao.call_model_live", True, f"Live call fallita per quota/connettività provider: {str(ex)[:100]}")
-except Exception as e:
-    record("mao.call_model_live", False, str(e))
-
-try:
-    assert mao is not None
-    raised = False
-    try:
-        run(mao.call_model("s", "u", provider="nonexistent_xyz", fallback_on_error=False))
-    except Exception:
-        raised = True
-    record("mao.unknown_provider_raises", raised, "" if raised else "nessuna eccezione")
-except Exception as e:
-    record("mao.unknown_provider_raises", False, str(e))
-
-try:
-    # enable_reasoning non deve crashare il dispatch
-    assert mao is not None
-    # Mock il client per non fare chiamate reali
-    async def _test_reasoning_param():
-        from unittest.mock import MagicMock, patch
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "test"
-        with patch.object(mao.providers["openrouter"]["client"].chat.completions, "create",
-                          return_value=mock_response):
-            result = await mao.call_model("sys", "usr", enable_reasoning=True, provider="openrouter")
-        assert result == "test"
-        return True
-
-    res, ms = run(timed_async(_test_reasoning_param()))
-    record("mao.enable_reasoning_kwarg", res, duration_ms=ms)
-except Exception as e:
-    record("mao.enable_reasoning_kwarg", False, traceback.format_exc(limit=2))
+    async def test_i_tool_condivisi_dal_grafo_sono_quelli_del_registro(self):
+        _, condivisi = build_graph()
+        self.assertIs(condivisi["ac_living_room"], sensor_tools._TOOL_REGISTRY["ac_living_room"])
 
 
-# ── SEZIONE 5: BaseAgent ──────────────────────────────────────────────────
-print("\n[5] BaseAgent")
-
-agent = None
-try:
-    from app.agents.base_agent import BaseAgent
-
-    class _DummyAgent(BaseAgent):
-        async def process(self, state, recent_events, relevant_readings, agent_escalations):
-            return {}
-
-    agent = _DummyAgent("dummy", ["ac_living_room"], 30, 1.0)
-    record("base_agent.init", True)
-except Exception as e:
-    record("base_agent.init", False, traceback.format_exc(limit=2))
-
-try:
-    assert agent is not None
-    from app.tools.sensor_tools import get_default_iot_tools as _gdt
-
-    async def _test_apply_idempotent():
-        tools = _gdt()
-        log = EventLog(db_path=DB_PATH)
-        await log.unblock_target("ac_living_room", "reset for test", actor="test")
-        await tools["ac_living_room"].set_tool_value("OFF")
-        r1 = await agent.apply_status("ac_living_room", "TURN_ON_AC", "22.5°C", "test", False, tools)
-        assert r1 is True, "primo apply deve essere True"
-        r2 = await agent.apply_status("ac_living_room", "TURN_ON_AC", "22.5°C", "test", False, tools)
-        assert r2 is False, "secondo apply (stesso valore) deve essere False"
-        return True
-
-    res, ms = run(timed_async(_test_apply_idempotent()))
-    record("base_agent.apply_status_idempotency", res, duration_ms=ms)
-except Exception as e:
-    record("base_agent.apply_status_idempotency", False, traceback.format_exc(limit=2))
-
-try:
-    assert agent is not None
-    events = [
-        {"actor": "Brain", "action": "FORCE_SHUTDOWN", "target": "ac_living_room"},
-        {"actor": "dummy", "action": "TURN_ON", "target": "ac_living_room"},
-    ]
-    conflict, evt = agent.check_for_recent_conflict("ac_living_room", events)
-    assert conflict is True
-    no_conflict, _ = agent.check_for_recent_conflict("heater_bedroom", [])
-    assert no_conflict is False
-    record("base_agent.check_for_recent_conflict", True)
-except Exception as e:
-    record("base_agent.check_for_recent_conflict", False, str(e))
-
-try:
-    assert agent is not None
-    esc = agent.create_escalation("ac_living_room", "22.5°C", "reason", True, [])
-    assert esc["source_agent"] == "dummy"
-    assert esc["proposed_action"] == "22.5°C"
-    assert esc["conflict_detected"] is True
-    record("base_agent.create_escalation", True)
-except Exception as e:
-    record("base_agent.create_escalation", False, str(e))
+# ── 4. MAO ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
 
-# ── SEZIONE 6: ClimateAgent ───────────────────────────────────────────────
-print("\n[6] ClimateAgent")
+class MaoTest(unittest.IsolatedAsyncioTestCase):
+    async def crea_mao(self, **variabili):
+        with patch.dict(os.environ, variabili):
+            mao = Mao()
+        self.addAsyncCleanup(mao.aclose)
+        return mao
 
-try:
-    from app.agents.agent_climate import ClimateAgent
-    from app.tools.sensor_tools import get_default_iot_tools as _gdt2
+    async def test_provider_registrati_e_predefinito_da_ambiente(self):
+        mao = await self.crea_mao(DEFAULT_PROVIDER="openrouter")
 
-    tools_c = _gdt2()
-    BASE_STATE = {
-        "messages": [], "readings": [], "recent_events": [],
-        "pending_escalations": [], "next_agent": "brain",
-        "hitl_required": False, "config": {},
-    }
+        self.assertEqual(mao.default_provider, "openrouter")
+        self.assertTrue({"openrouter", "google_studio", "mistral", "local"} <= set(mao.providers))
 
-    async def _climate_call(mock_resp: str, ac_val: str = "OFF"):
-        await tools_c["ac_living_room"].set_tool_value(ac_val)
-        ag = ClimateAgent(tools=tools_c)
-        with patch.object(ag, "ask_brain", return_value=mock_resp):
-            return await ag.process(dict(BASE_STATE), [], [], [])
+    async def test_provider_sconosciuto_solleva_un_errore_classificato(self):
+        mao = await self.crea_mao()
+        with self.assertRaises(ErroreLLM) as ctx:
+            await mao.call_model("s", "u", provider="provider_inesistente", fallback_on_error=False)
+        self.assertEqual(ctx.exception.codice, "PROVIDER_NON_SUPPORTATO")
 
-    # ACTION branch
-    r, ms = run(timed_async(_climate_call("DECISIONE: ACTION\nMOTIVAZIONE: caldo")))
-    assert r.get("next_agent") == "END"
-    record("climate_agent.action_branch", True, duration_ms=ms)
+    async def test_enable_reasoning_arriva_al_client_e_non_rompe_la_chiamata(self):
+        mao = await self.crea_mao(OPENROUTER_API_KEY="chiave-di-prova")
+        risposta = MagicMock()
+        risposta.choices = [MagicMock()]
+        risposta.choices[0].message.content = "test"
+        risposta.choices[0].finish_reason = "stop"
+        create = AsyncMock(return_value=risposta)
 
-    # NONE branch (già a regime)
-    r2, ms2 = run(timed_async(_climate_call("DECISIONE: NONE\nMOTIVAZIONE: ok", ac_val="22.5°C")))
-    assert r2.get("next_agent") == "END"
-    record("climate_agent.none_branch", True, duration_ms=ms2)
+        with patch.object(mao.providers["openrouter"]["client"].chat.completions, "create", create):
+            risultato = await mao.call_model("sys", "usr", enable_reasoning=True, provider="openrouter")
 
-    # BLOCKED cortocircuito — ask_brain NON deve essere chiamato
-    async def _blocked_test():
-        await tools_c["ac_living_room"].set_tool_value("REJECTED")
-        ag = ClimateAgent(tools=tools_c)
-        called = []
-        with patch.object(ag, "ask_brain", side_effect=lambda *a, **kw: called.append(1) or ""):
-            r = await ag.process(dict(BASE_STATE), [], [], [])
-        await tools_c["ac_living_room"].set_tool_value("OFF")
-        assert r.get("next_agent") == "END"
-        assert len(called) == 0, f"ask_brain chiamato {len(called)} volte con stato REJECTED"
-        return True
-
-    r3, ms3 = run(timed_async(_blocked_test()))
-    record("climate_agent.blocked_shortcircuit", r3, duration_ms=ms3)
-
-    # ESCALATE branch — NO apply_status sul tool (Fix 3)
-    async def _escalate_test():
-        await tools_c["ac_living_room"].set_tool_value("OFF")
-        ag = ClimateAgent(tools=tools_c)
-        # Simula conflitto: evento da actor diverso da agent_climate
-        conflict_event = {"actor": "agent_security", "action": "FORCE_SHUTDOWN",
-                          "target": "ac_living_room", "escalated": 0}
-        with patch.object(ag, "ask_brain", return_value="DECISIONE: ESCALATE\nMOTIVAZIONE: conflitto"):
-            r = await ag.process(dict(BASE_STATE), [conflict_event], [], [])
-        # il tool NON deve essere cambiato dal branch ESCALATE
-        val = await tools_c["ac_living_room"].get_tool_value()
-        assert val == "OFF", f"tool modificato durante ESCALATE: {val}"
-        assert r.get("next_agent") == "brain"
-        assert len(r.get("pending_escalations", [])) == 1
-        return True
-
-    r4, ms4 = run(timed_async(_escalate_test()))
-    record("climate_agent.escalate_no_apply", r4, duration_ms=ms4)
-
-except Exception as e:
-    record("climate_agent.*", False, traceback.format_exc(limit=4))
+        self.assertEqual(risultato, "test")
+        self.assertEqual(create.await_args.kwargs["extra_body"], {"reasoning": {"enabled": True}})
 
 
-# ── SEZIONE 7: BrainAgent ─────────────────────────────────────────────────
-print("\n[7] BrainAgent")
+@unittest.skipUnless(os.getenv("RUN_LLM_TESTS") == "1", "chiamata reale a un LLM: impostare RUN_LLM_TESTS=1")
+class MaoRealeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_chiamata_reale_al_provider_predefinito(self):
+        mao = Mao()
+        self.addAsyncCleanup(mao.aclose)
+        risposta = await mao.call_model("Rispondi solo con OK.", "Test connessione.", max_tokens=200)
+        self.assertTrue(risposta.strip())
 
-try:
-    from app.graph.orchestrator import BrainAgent
-    from app.tools.sensor_tools import get_default_iot_tools as _gdt3
 
-    tools_b = _gdt3()
-    brain = BrainAgent(tools=list(tools_b.values()))
+# ── 5. BaseAgent ───────────────────────────────────────────────────────────────────────────────────────────────
 
-    async def _brain_call(pending=None, next_agent="brain"):
-        state = {**{
-            "messages": [], "readings": [], "recent_events": [],
-            "pending_escalations": pending or [],
-            "next_agent": next_agent, "hitl_required": False, "config": {},
-        }}
-        with patch.object(brain, "ask_brain", return_value="DECISIONE: APPROVA\nMOTIVAZIONE: ok"):
-            return await brain.process(state, [], [], pending or [])
 
-    # Route to climate
-    r, ms = run(timed_async(_brain_call()))
-    assert r.get("next_agent") == "agent_climate", f"got: {r.get('next_agent')}"
-    record("brain_agent.route_to_climate", True, duration_ms=ms)
+class AgenteDiProva(BaseAgent):
+    async def process(self, state, recent_events, relevant_readings, agent_escalations):
+        return {}
 
-    # Reconciliation approva
-    esc = {"source_agent": "agent_climate", "target_device": "ac_living_room",
-           "proposed_action": "22.5°C", "reason": "test", "conflict_detected": True, "context_events": []}
 
-    async def _reconcile():
-        await tools_b["ac_living_room"].set_tool_value("OFF")
-        return await _brain_call(pending=[esc])
+class BaseAgentTest(BaseTest):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.agente = self.usa_db(AgenteDiProva("dummy", ["ac_living_room"], 30, 1.0))
 
-    r2, ms2 = run(timed_async(_reconcile()))
-    assert r2.get("next_agent") == "END"
-    assert r2.get("pending_escalations") == []
-    record("brain_agent.reconcile_escalation_approva", True, duration_ms=ms2)
+    async def test_l_applicazione_dello_stato_e_idempotente(self):
+        tool = get_default_iot_tools()["ac_living_room"]
+        await tool.set_tool_value("OFF")
+        strumenti = get_default_iot_tools()
 
-    # Reconciliation respingi
-    async def _reconcile_reject():
-        await tools_b["ac_living_room"].set_tool_value("OFF")
-        state = {"messages": [], "readings": [], "recent_events": [],
-                 "pending_escalations": [esc], "next_agent": "brain",
-                 "hitl_required": False, "config": {}}
-        with patch.object(brain, "ask_brain", return_value="DECISIONE: RESPINGI\nMOTIVAZIONE: finestra aperta"):
-            r = await brain.process(state, [], [], [esc])
-        val = await tools_b["ac_living_room"].get_tool_value()
-        assert val == "REJECTED", f"tool non marcato REJECTED: {val}"
-        return True
+        primo = await self.agente.apply_status("ac_living_room", "TURN_ON_AC", "22.5°C", "test", False, strumenti)
+        secondo = await self.agente.apply_status("ac_living_room", "TURN_ON_AC", "22.5°C", "test", False, strumenti)
 
-    r3, ms3 = run(timed_async(_reconcile_reject()))
-    record("brain_agent.reconcile_respingi", r3, duration_ms=ms3)
+        self.assertIs(primo, True)
+        self.assertIs(secondo, False)
 
-    # check_body_status
-    async def _check_body():
-        readings = [{"sensor_id": k, "agent_owner": "brain",
-                     "value": str(await v.get_tool_value()), "unit": ""}
-                    for k, v in tools_b.items()]
-        state = {"messages": [], "readings": readings, "recent_events": [],
-                 "pending_escalations": [], "next_agent": "END", "hitl_required": False, "config": {}}
-        with patch.object(brain, "ask_brain", return_value="STATUS: OK\nDETTAGLI: tutto ok"):
-            r = await brain.check_body_status(state, readings, [])
-        assert "messages" in r
-        return True
+    async def test_conflitto_recente_da_un_altro_attore(self):
+        eventi = [
+            {"actor": "Brain", "action": "FORCE_SHUTDOWN", "target": "ac_living_room"},
+            {"actor": "dummy", "action": "TURN_ON", "target": "ac_living_room"},
+        ]
+        conflitto, evento = self.agente.check_for_recent_conflict("ac_living_room", eventi)
+        assenza, _ = self.agente.check_for_recent_conflict("heater_bedroom", [])
 
-    r4, ms4 = run(timed_async(_check_body()))
-    record("brain_agent.check_body_status", r4, duration_ms=ms4)
+        self.assertTrue(conflitto)
+        self.assertEqual(evento["actor"], "Brain")
+        self.assertFalse(assenza)
 
-    async def _semantic_override_on():
-        from app.tools.sensor_tools import get_default_iot_tools, get_tool
-        tools_o = get_default_iot_tools()
-        brain_override = BrainAgent(tools=list(tools_o.values()))
-        for target in ["main_breaker", "emergency_lights"]:
-            brain_override.tools[target] = get_tool(target, "OFF", "")
-            await brain_override.tools[target].set_tool_value("OFF")
+    async def test_creazione_di_un_escalation(self):
+        esc = self.agente.create_escalation("ac_living_room", "22.5°C", "motivo", True, [])
 
-        with patch.object(
-            brain_override,
-            "ask_brain",
-            return_value='[{"target": "main_breaker", "action": "TURN_ON", "value": null}, {"target": "emergency_lights", "action": "TURN_ON", "value": null}]',
-        ):
-            msgs = await brain_override._execute_semantic_override(
-                human_directive="Riattiva main_breaker ed emergency_lights",
-                fallback_target="main_breaker",
+        self.assertEqual((esc["source_agent"], esc["proposed_action"], esc["conflict_detected"]), ("dummy", "22.5°C", True))
+        self.assertTrue(esc["id"])
+        self.assertIsNone(esc["tool_result"])
+
+
+# ── 6. ClimateAgent ────────────────────────────────────────────────────────────────────────────────────────────
+
+
+class ClimateAgentTest(BaseTest):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.tools = get_default_iot_tools()
+
+    async def esegui(self, risposta_llm, valore_ac="OFF", eventi=None):
+        await self.tools["ac_living_room"].set_tool_value(valore_ac)
+        agente = self.usa_db(ClimateAgent(tools=self.tools))
+        with patch.object(agente, "ask_brain", AsyncMock(return_value=risposta_llm)) as ask:
+            risultato = await agente.process(dict(STATO_BASE), eventi or [], [], [])
+        return risultato, ask
+
+    async def test_ramo_action_attiva_il_condizionatore(self):
+        risultato, _ = await self.esegui("DECISIONE: ACTION\nMOTIVAZIONE: caldo")
+        self.assertEqual(risultato["next_agent"], "END")
+        self.assertEqual(await self.tools["ac_living_room"].get_tool_value(), "22.5°C")
+
+    async def test_ramo_none_lascia_tutto_com_e(self):
+        risultato, _ = await self.esegui("DECISIONE: NONE\nMOTIVAZIONE: ok", valore_ac="22.5°C")
+        self.assertEqual(risultato["next_agent"], "END")
+        self.assertEqual(await self.tools["ac_living_room"].get_tool_value(), "22.5°C")
+
+    async def test_un_dispositivo_bloccato_non_interpella_il_modello(self):
+        risultato, ask = await self.esegui("", valore_ac="REJECTED")
+        self.assertEqual(risultato["next_agent"], "END")
+        ask.assert_not_awaited()
+
+    async def test_ramo_escalate_non_tocca_il_dispositivo(self):
+        conflitto = {"actor": "agent_security", "action": "FORCE_SHUTDOWN", "target": "ac_living_room", "escalated": 0}
+
+        risultato, _ = await self.esegui("DECISIONE: ESCALATE\nMOTIVAZIONE: conflitto", eventi=[conflitto])
+
+        self.assertEqual(await self.tools["ac_living_room"].get_tool_value(), "OFF")
+        self.assertEqual(risultato["next_agent"], "brain")
+        self.assertEqual(len(risultato["pending_escalations"]), 1)
+
+
+# ── 7. BrainAgent ──────────────────────────────────────────────────────────────────────────────────────────────
+
+
+class BrainAgentTest(BaseTest):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.tools = get_default_iot_tools()
+        self.brain = self.usa_db(BrainAgent(tools=list(self.tools.values())))
+        self.escalation = {
+            "source_agent": "agent_climate", "target_device": "ac_living_room", "proposed_action": "22.5°C",
+            "reason": "test", "conflict_detected": True, "context_events": [],
+        }
+
+    async def chiama(self, risposta_llm, pendenti=None, prossimo="brain"):
+        stato = {**STATO_BASE, "pending_escalations": pendenti or [], "next_agent": prossimo}
+        with patch.object(self.brain, "ask_brain", AsyncMock(return_value=risposta_llm)):
+            return await self.brain.process(stato, [], [], pendenti or [])
+
+    async def test_instrada_verso_l_agente_clima(self):
+        self.assertEqual((await self.chiama("DECISIONE: APPROVA"))["next_agent"], "agent_climate")
+
+    async def test_approvazione_di_un_escalation(self):
+        await self.tools["ac_living_room"].set_tool_value("OFF")
+
+        risultato = await self.chiama("DECISIONE: APPROVA\nMOTIVAZIONE: ok", [self.escalation])
+
+        self.assertEqual((risultato["next_agent"], risultato["pending_escalations"]), ("END", []))
+        self.assertEqual(await self.tools["ac_living_room"].get_tool_value(), "22.5°C")
+
+    async def test_rifiuto_di_un_escalation_marca_il_dispositivo(self):
+        await self.tools["ac_living_room"].set_tool_value("OFF")
+
+        await self.chiama("DECISIONE: RESPINGI\nMOTIVAZIONE: finestra aperta", [self.escalation])
+
+        self.assertEqual(await self.tools["ac_living_room"].get_tool_value(), "REJECTED")
+
+    async def test_check_body_status(self):
+        letture = [{"sensor_id": k, "agent_owner": "brain", "value": str(await v.get_tool_value()), "unit": ""} for k, v in self.tools.items()]
+        stato = {**STATO_BASE, "readings": letture, "next_agent": "END"}
+
+        with patch.object(self.brain, "ask_brain", AsyncMock(return_value="STATUS: OK\nDETTAGLI: tutto ok")):
+            risultato = await self.brain.check_body_status(stato, letture, [])
+
+        self.assertIn("messages", risultato)
+
+    async def test_override_semantico_accende_con_lo_stato_on(self):
+        for nome in ("main_breaker", "emergency_lights"):
+            self.brain.tools[nome] = get_tool(nome, "OFF", "")
+
+        with patch.object(self.brain, "ask_brain", AsyncMock(return_value=json.dumps([
+            {"target": "main_breaker", "action": "TURN_ON", "value": None},
+            {"target": "emergency_lights", "action": "TURN_ON", "value": None},
+        ]))):
+            messaggi = await self.brain._execute_semantic_override(
+                human_directive="Riattiva main_breaker ed emergency_lights", fallback_target="main_breaker",
                 fallback_action="FORCE_SHUTDOWN",
             )
 
-        assert await brain_override.tools["main_breaker"].get_tool_value() == "ON"
-        assert await brain_override.tools["emergency_lights"].get_tool_value() == "ON"
-        assert all("FORCE_SHUTDOWN" not in m for m in msgs)
-        return True
-
-    r5, ms5 = run(timed_async(_semantic_override_on()))
-    record("brain_agent.override_turn_on_uses_on_state", r5, duration_ms=ms5)
-
-except Exception as e:
-    record("brain_agent.*", False, traceback.format_exc(limit=4))
-
-
-# ── SEZIONE 8: Builder ────────────────────────────────────────────────────
-print("\n[8] Builder")
-
-try:
-    from app.graph.builder import build_graph
-    from app.tools.sensor_tools import _TOOL_REGISTRY
-
-    graph, shared = build_graph()
-    assert "ac_living_room" in shared
-    assert shared["ac_living_room"] is _TOOL_REGISTRY["ac_living_room"], "singleton non condiviso"
-    record("builder.shared_tool_singleton", True)
-except Exception as e:
-    record("builder.shared_tool_singleton", False, str(e))
-
-
-# ── SEZIONE 9: EventProducer — filtro ─────────────────────────────────────
-print("\n[9] EventProducer filter")
-
-try:
-    from app.core.constants import is_control_flag as icf
-
-    blocked = ["REJECTED", "RECONCILED_ACT", "RESOLVED_ESC", "ESCALATION_PROP", "BLOCKED"]
-    physical = ["22.5°C", "OFF", "LOCKED", "DISARMED", "0", "100%"]
-
-    assert all(icf(v) for v in blocked), "flag non riconosciuti"
-    assert not any(icf(v) for v in physical), "valori fisici erroneamente marcati come flag"
-    record("event_producer.control_flag_filter", True)
-except Exception as e:
-    record("event_producer.control_flag_filter", False, str(e))
-
-
-# ── SEZIONE 10: API Schemas + Routes ──────────────────────────────────────
-print("\n[10] API")
-
-try:
-    from app.api.main import (
-        RunCycleRequest, ToolWriteRequest, SeedConflictRequest,
-        LlmProxyRequest, CreateSubAgentRequest,
-    )
-    import json as _json
-
-    assert RunCycleRequest().force_next_agent == "brain"
-    assert ToolWriteRequest(target="ac_living_room", value="22.5°C").value == "22.5°C"
-    assert SeedConflictRequest().actor == "agent_security"
-    assert LlmProxyRequest(system_prompt="s", user_prompt="u").enable_reasoning is False
-
-    template = _json.dumps({"agent_name": "agent_security", "managed_targets": ["door"]})
-    ca = CreateSubAgentRequest(agent_definition=template)
-    assert _json.loads(ca.agent_definition)["agent_name"] == "agent_security"
-
-    record("api.schemas_valid", True)
-except Exception as e:
-    record("api.schemas_valid", False, traceback.format_exc(limit=2))
-
-try:
-    from app.api.main import app as fastapi_app
-    routes = [r.path for r in fastapi_app.routes]
-    expected = ["/", "/graph/run", "/tools", "/llm/invoke", "/agents/create", "/graph/health-check"]
-    missing = [p for p in expected if p not in routes]
-    assert not missing, f"route mancanti: {missing}"
-    record("api.routes_registered", True)
-except Exception as e:
-    record("api.routes_registered", False, str(e))
-
-# endpoint /agents/create con JSON valido
-try:
-    async def _test_create_agent_endpoint():
-        from app.api.main import create_sub_agent, CreateSubAgentRequest
-        import json as _json
-        valid = _json.dumps({"agent_name": "agent_test", "managed_targets": ["door"]})
-        result = await create_sub_agent(CreateSubAgentRequest(agent_definition=valid))
-        assert "registered" in result["status"]
-        assert result["agent_name"] == "agent_test"
-        return True
-
-    res, ms = run(timed_async(_test_create_agent_endpoint()))
-    record("api.create_sub_agent_valid", res, duration_ms=ms)
-except Exception as e:
-    record("api.create_sub_agent_valid", False, str(e))
-
-try:
-    async def _test_create_agent_bad_json():
-        from app.api.main import create_sub_agent, CreateSubAgentRequest
-        from fastapi import HTTPException
-        try:
-            await create_sub_agent(CreateSubAgentRequest(agent_definition="not json"))
-            return False  # doveva sollevare eccezione
-        except HTTPException as e:
-            assert e.status_code == 422
-            return True
-
-    res, ms = run(timed_async(_test_create_agent_bad_json()))
-    record("api.create_sub_agent_invalid_json", res, duration_ms=ms)
-except Exception as e:
-    record("api.create_sub_agent_invalid_json", False, str(e))
-
-try:
-    async def _test_create_agent_missing_fields():
-        from app.api.main import create_sub_agent, CreateSubAgentRequest
-        from fastapi import HTTPException
-        import json as _json
-        try:
-            await create_sub_agent(CreateSubAgentRequest(agent_definition=_json.dumps({"agent_name": "x"})))
-            return False
-        except HTTPException as e:
-            assert e.status_code == 422
-            return True
-
-    res, ms = run(timed_async(_test_create_agent_missing_fields()))
-    record("api.create_sub_agent_missing_fields", res, duration_ms=ms)
-except Exception as e:
-    record("api.create_sub_agent_missing_fields", False, str(e))
-
-
-# ── SEZIONE 11: TTL & Event-Driven Unblock ──────────────────────────────────
-print("\n[11] TTL & Event-Driven Unblock")
-
-try:
-    from app.core.constants import is_flag_expired
-    from datetime import datetime, timedelta, timezone
-
-    old_ts = (datetime.now(timezone.utc) - timedelta(minutes=120)).strftime("%Y-%m-%d %H:%M:%S")
-    fresh_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-    assert is_flag_expired(old_ts, ttl_minutes=60) is True, "timestamp vecchio deve risultare scaduto"
-    assert is_flag_expired(fresh_ts, ttl_minutes=60) is False, "timestamp recente NON deve risultare scaduto"
-    record("ttl.is_flag_expired", True)
-except Exception as e:
-    record("ttl.is_flag_expired", False, str(e))
-
-try:
-    from app.tools.event_log import EventLog
-
-    async def _test_unblock_and_ttl_db():
-        log = EventLog(db_path=DB_PATH)
-        await log.unblock_target("ac_living_room", "test unblock", actor="test")
-        events = await log.get_recent_events()
-        assert any(e.get("action") == "UNBLOCKED" and e.get("target") == "ac_living_room" for e in events)
-
-        expired_count = await log.expire_old_control_flags(ttl_minutes=0)  # forza scadenza di tutti
-        assert isinstance(expired_count, int)
-        return True
-
-    res, ms = run(timed_async(_test_unblock_and_ttl_db()))
-    record("ttl.unblock_and_expire_db", res, duration_ms=ms)
-except Exception as e:
-    record("ttl.unblock_and_expire_db", False, str(e))
-
-
-# ── SEZIONE 12: HITL (Human-in-the-Loop) ───────────────────────────────────
-print("\n[12] HITL (Human-in-the-Loop)")
-
-try:
-    from app.api.main import HitlResumeRequest, UnblockTargetRequest
-    hr = HitlResumeRequest(decision="APPROVA", reasoning="ok via test")
-    assert hr.decision == "APPROVA"
-    ub = UnblockTargetRequest(target="ac_living_room")
-    assert ub.target == "ac_living_room"
-    record("hitl.schemas", True)
-except Exception as e:
-    record("hitl.schemas", False, str(e))
-
-try:
-    from app.graph.hitl_config import hitl_manager, HitlConfigSchema
-
-    hitl_manager.update_config(
-        hitl_all=False,
-        hitl_nodes=["organ_security"],
-        hitl_targets=["front_door_lock"],
-        hitl_actions=["FORCE_SHUTDOWN"],
-        max_wait_seconds=120,
-    )
-    cfg = hitl_manager.get_config()
-    assert cfg.hitl_nodes == ["organ_security"]
-    assert cfg.hitl_targets == ["front_door_lock"]
-    assert cfg.hitl_actions == ["FORCE_SHUTDOWN"]
-    assert cfg.max_wait_seconds == 120
-
-    # Test decision logic
-    assert hitl_manager.should_interrupt("organ_security", {}) is True
-    assert hitl_manager.should_interrupt("agent_climate", {}) is False
-    assert hitl_manager.should_interrupt("agent_climate", {}, proposed_target="front_door_lock") is True
-    assert hitl_manager.should_interrupt("agent_climate", {}, proposed_action="FORCE_SHUTDOWN") is True
-
-    # Reset
-    hitl_manager.update_config(hitl_all=False, hitl_nodes=[], hitl_targets=[], hitl_actions=[], max_wait_seconds=None)
-    record("hitl.dynamic_config_manager", True)
-except Exception as e:
-    record("hitl.dynamic_config_manager", False, str(e))
-
-# 12c: HITL OVERRIDE path — builder chiama _execute_semantic_override, non scrive RECONCILED_
-try:
-    async def _test_hitl_override_path():
-        from app.graph.builder import wrap_node_with_hitl
-        from app.graph.orchestrator import BrainAgent
-        from app.graph.hitl_config import hitl_manager
-        from app.tools.sensor_tools import get_tool
-        from unittest.mock import patch
-
-        # Configura HITL in modo che 'brain' venga sempre intercettato
-        hitl_manager.update_config(hitl_all=True, hitl_nodes=["brain"], hitl_targets=[], hitl_actions=[], max_wait_seconds=None)
-
-        brain = BrainAgent()
-        heater = get_tool("heater_override_test", initial_value="OFF", unit="°C")
-        brain.tools["heater_override_test"] = heater
-
-        override_called = []
-
-        async def mock_semantic_override(human_directive, fallback_target, fallback_action):
-            override_called.append(human_directive)
-            await heater.set_tool_value("22°C")
-            return [f"[Brain_Override] ✓ ESEGUITO — UNBLOCK_AND_SET su 'heater_override_test' → '22°C'"]
-
-        brain._execute_semantic_override = mock_semantic_override
-        wrapped = wrap_node_with_hitl("brain", brain)
-
-        fake_state = {
-            "messages": [], "readings": [], "recent_events": [],
-            "pending_escalations": [], "next_agent": "brain",
-            "hitl_required": True, "config": {},
-        }
-
-        # Patch interrupt() per simulare la risposta OVERRIDE senza sospensione LangGraph
-        with patch("app.graph.builder.interrupt", return_value={"decision": "OVERRIDE", "reasoning": "Accendi la stufa per mia nonna a 22 gradi"}):
-            result = await wrapped(fake_state)
-
-        # Cleanup HITL config
-        hitl_manager.update_config(hitl_all=False, hitl_nodes=[], hitl_targets=[], hitl_actions=[], max_wait_seconds=None)
-
-        assert len(override_called) == 1, f"_execute_semantic_override non è stato chiamato: override_called={override_called}"
-        val = await heater.get_tool_value()
-        assert val == "22°C", f"Heater deve essere 22°C dopo override, è: {val}"
-        assert result.get("next_agent") == "END"
-        assert "Brain_Override" in result["messages"][-1].content or "ESEGUITO" in result["messages"][-1].content
-        return True
-
-    res, ms = run(timed_async(_test_hitl_override_path()))
-    record("hitl.override_semantic_path", res, duration_ms=ms)
-except Exception as e:
-    record("hitl.override_semantic_path", False, traceback.format_exc(limit=4))
-
-
-
-# ── SEZIONE 13: Dynamic Sub-Agents & Hierarchy ──────────────────────────────
-print("\n[13] Dynamic Sub-Agents & Hierarchy")
-
-try:
-    from app.agents.agent_registry import AgentRegistry
-    from app.agents.dynamic_agent import DynamicAgent
-
-    async def _test_registry_and_dynamic_agent():
-        reg = AgentRegistry(db_path=DB_PATH)
-        await reg.init_registry_db()
-
-        # Registra un organo (livello 1) ed un componente dell'organo (livello 2)
-        await reg.register_agent_config({
-            "name": "organ_security",
-            "level": 1,
-            "parent_agent_name": "Brain",
-            "managed_targets": ["alarm_system"],
-            "sub_agent_names": ["component_door_lock"],
-        })
-        await reg.register_agent_config({
-            "name": "component_door_lock",
-            "level": 2,
-            "parent_agent_name": "organ_security",
-            "managed_targets": ["front_door_lock"],
-            "sub_agent_names": [],
-        })
-
-        configs = await reg.get_all_agent_configs()
-        names = [c["name"] for c in configs]
-        assert "organ_security" in names
-        assert "component_door_lock" in names
-
-        tree = await reg.get_hierarchy_tree()
-        assert tree["root"] == "Brain"
-
-        instances = await reg.build_agent_instances()
-        assert "organ_security" in instances
-        assert "component_door_lock" in instances
-        assert isinstance(instances["organ_security"], DynamicAgent)
-
-        await reg.delete_agent("component_door_lock")
-        await reg.delete_agent("organ_security")
-        return True
-
-    res, ms = run(timed_async(_test_registry_and_dynamic_agent()))
-    record("dynamic_agent.registry_and_hierarchy", res, duration_ms=ms)
-except Exception as e:
-    record("dynamic_agent.registry_and_hierarchy", False, traceback.format_exc(limit=3))
-
-
-# ── SEZIONE 14: Medical Tools & Physiology Agents ─────────────────────────
-print("\n[14] Medical Tools & Physiology Agents")
-
-try:
-    from app.tools.medical_tools import (
-        deterministic_biometric_normalizer,
-        HeartRateRegulatorTool,
-        LungVentilatorTool,
-    )
-
-    # 1. Test normalizzazione deterministica
-    norm_normal = deterministic_biometric_normalizer(75.0, 60.0, 100.0)
-    assert norm_normal["is_in_range"] is True
-    assert norm_normal["normalized_score"] == -0.25
-
-    norm_patho = deterministic_biometric_normalizer(160.0, 60.0, 100.0)
-    assert norm_patho["is_in_range"] is False
-    assert norm_patho["recommended_target"] == 100.0
-
-    record("medical_tools.deterministic_normalizer", True)
-except Exception as e:
-    record("medical_tools.deterministic_normalizer", False, str(e))
-
-try:
-    from app.tools.medical_tools import HeartRateRegulatorTool, LungVentilatorTool
-
-    async def _test_medical_tools_async():
-        hr = HeartRateRegulatorTool()
-        assert await hr.get_tool_value() == "72.0 BPM"
-        await hr.set_tool_value(160.0)
-        assert await hr.get_tool_value() == "160.0 BPM"
-
-        lung = LungVentilatorTool()
-        assert await lung.get_tool_value() == "98.0%"
-        await lung.set_tool_value(82.0)
-        assert await lung.get_tool_value() == "82.0%"
-        return True
-
-    res, ms = run(timed_async(_test_medical_tools_async()))
-    record("medical_tools.tools_get_set", res, duration_ms=ms)
-except Exception as e:
-    record("medical_tools.tools_get_set", False, str(e))
-
-try:
-    from app.agents.medical_agents import CardiovascularOrganAgent, RespiratoryOrganAgent
-    from app.tools.medical_tools import HeartRateRegulatorTool, LungVentilatorTool
-
-    async def _test_medical_agents_homeostasis():
-        hr = HeartRateRegulatorTool()
-        await hr.set_tool_value(160.0)
-
-        lung = LungVentilatorTool()
-        await lung.set_tool_value(82.0)
-
-        med_tools = {"cardiac_pacemaker": hr, "oxygen_regulator": lung}
-        cardio = CardiovascularOrganAgent(tools=med_tools)
-        resp = RespiratoryOrganAgent(tools=med_tools)
-
-        # Invocazione CardiovascularOrganAgent
-        state_cardio = {
-            "messages": [],
-            "readings": [{"sensor_id": "cardiac_pacemaker", "agent_owner": "test", "value": "160.0", "unit": "BPM"}],
-            "recent_events": [],
-            "pending_escalations": [],
-            "next_agent": "organ_cardiovascular",
-            "hitl_required": False,
-            "config": {},
-        }
-        res_c = await cardio(state_cardio)
-        assert res_c["next_agent"] == "brain"  # Nome canonico del nodo Brain nel grafo
-
-        # Invocazione RespiratoryOrganAgent
-        state_resp = {
-            "messages": [],
-            "readings": [{"sensor_id": "oxygen_regulator", "agent_owner": "test", "value": "82.0", "unit": "%"}],
-            "recent_events": [],
-            "pending_escalations": [],
-            "next_agent": "organ_respiratory",
-            "hitl_required": False,
-            "config": {},
-        }
-        res_r = await resp(state_resp)
-        assert await lung.get_tool_value() == "95.0%"  # Ripristinato target SpO2 omeostatico
-        return True
-
-    res, ms = run(timed_async(_test_medical_agents_homeostasis()))
-    record("medical_agents.homeostasis_restoration", res, duration_ms=ms)
-except Exception as e:
-    record("medical_agents.homeostasis_restoration", False, traceback.format_exc(limit=3))
-
-
-
-# ── SEZIONE 15: force_execute_tool & On-Demand Tool Creation ─────────────────
-
-print("\n[15] Brain Override & force_execute_tool")
-
-# 15a: force_execute_tool bypassa i lock di priorità e aggiorna il tool
-try:
-    async def _test_force_execute():
-        from app.tools.tool_wrapper import force_execute_tool
-        from app.tools.sensor_tools import get_tool
-        from app.tools.event_log import EventLog
-
-        # Semina un blocco attivo nel DB in-memory
-        db_path = ":memory:"
-        import aiosqlite
-        log = EventLog(target=["pool_pump"])
-        await log.log_event(
-            actor="organ_energy",
-            action="FORCE_SHUTDOWN",
-            target="pool_pump",
-            old_value="ON",
-            new_value="OFF",
-            reasoning="Picco di rete",
-            escalated=False,
+        self.assertEqual(await self.brain.tools["main_breaker"].get_tool_value(), "ON")
+        self.assertEqual(await self.brain.tools["emergency_lights"].get_tool_value(), "ON")
+        self.assertTrue(all("FORCE_SHUTDOWN" not in m for m in messaggi))
+
+    async def test_override_con_una_risposta_non_json_non_esegue_nessun_comando(self):
+        """Prima eseguiva un comando di ripiego non richiesto: ora il grafo si ferma per l'operatore."""
+        stufa = get_tool("heater_test_ov", initial_value="OFF", unit="°C")
+        self.brain.tools["heater_test_ov"] = stufa
+
+        with patch.object(self.brain, "ask_brain", AsyncMock(return_value="Mi dispiace, non ho capito.")):
+            with self.assertRaises(ErroreLLM) as ctx:
+                await self.brain._execute_semantic_override(
+                    human_directive="Accendi il riscaldamento", fallback_target="heater_test_ov", fallback_action="ON",
+                )
+
+        self.assertEqual(ctx.exception.codice, "RISPOSTA_NON_UTILIZZABILE")
+        self.assertEqual(await stufa.get_tool_value(), "OFF")
+
+    async def test_force_execute_tool_scavalca_i_blocchi_di_priorita(self):
+        log = self.log(target=["pool_pump"])
+        await log.log_event("organ_energy", "FORCE_SHUTDOWN", "pool_pump", "ON", "OFF", "Picco di rete", False)
+        pompa = get_tool("pool_pump", initial_value="OFF", unit="")
+
+        ok, messaggio = await force_execute_tool(
+            target="pool_pump", tool_obj=pompa, action="UNBLOCK_AND_SET", new_value="ON",
+            reasoning="richiesta dell'operatore", event_log=log,
         )
 
-        # Crea il tool on-demand (pool_pump non era pre-registrato)
-        pool_tool = get_tool("pool_pump", initial_value="OFF", unit="")
-        assert pool_tool is not None
+        self.assertTrue(ok, messaggio)
+        self.assertEqual(await pompa.get_tool_value(), "ON")
 
-        # force_execute_tool deve bypassare il blocco e portare il tool a "ON"
-        ok, msg = await force_execute_tool(
-            target="pool_pump",
-            tool_obj=pool_tool,
-            action="UNBLOCK_AND_SET",
-            new_value="ON",
-            reasoning="Nonna ha bisogno del riscaldamento della piscina",
-            event_log=log,
+
+# ── 8. Loop degli eventi ───────────────────────────────────────────────────────────────────────────────────────
+
+
+class EventProducerTest(BaseTest):
+    async def produci(self, tools, **kwargs):
+        from run_loop import sensor_event_producer
+
+        coda = asyncio.Queue()
+        compito = asyncio.create_task(sensor_event_producer(coda, tools, poll_interval=0.01, **kwargs))
+        self.addCleanup(compito.cancel)
+        await asyncio.sleep(0.05)
+        return coda, compito
+
+    async def test_un_cambio_fisico_genera_un_evento(self):
+        lampada = IoTDeviceTool("lampada", "OFF")
+        coda, compito = await self.produci({"lampada": lampada}, max_events=1)
+
+        await lampada.set_tool_value("ON")
+        evento = await asyncio.wait_for(coda.get(), 2)
+        await asyncio.wait_for(compito, 2)
+
+        self.assertEqual((evento.sensor_id, evento.old_value, evento.new_value), ("lampada", "OFF", "ON"))
+
+    async def test_un_flag_interno_non_genera_eventi(self):
+        lampada = IoTDeviceTool("lampada", "OFF")
+        coda, _ = await self.produci({"lampada": lampada})
+
+        await lampada.set_tool_value("REJECTED")
+        await asyncio.sleep(0.1)
+
+        self.assertTrue(coda.empty())
+
+    async def test_un_dispositivo_guasto_non_ferma_il_monitoraggio_degli_altri(self):
+        guasto, sano = IoTDeviceTool("guasto", "OFF"), IoTDeviceTool("sano", "OFF")
+        coda, compito = await self.produci({"guasto": guasto, "sano": sano}, max_events=1)
+
+        guasto.imposta_guasto("sensore offline")
+        await sano.set_tool_value("ON")
+        evento = await asyncio.wait_for(coda.get(), 2)
+        await asyncio.wait_for(compito, 2)
+
+        self.assertEqual(evento.sensor_id, "sano")
+
+
+# ── 9. API ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+class ApiTest(BaseTest):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.registro = AgentRegistry(db_path=self.db)
+        await self.registro.init_registry_db()
+        self.enterContext(patch("app.api.main.registry", self.registro))
+        self.enterContext(patch("app.api.main._recompile_system_graph", AsyncMock()))
+
+    def crea(self, definizione):
+        from app.api.main import CreateSubAgentRequest, create_sub_agent
+
+        testo = definizione if isinstance(definizione, str) else json.dumps(definizione)
+        return create_sub_agent(CreateSubAgentRequest(agent_definition=testo))
+
+    def test_gli_schemi_delle_richieste(self):
+        from app.api.main import CreateSubAgentRequest, LlmProxyRequest, RunCycleRequest, SeedConflictRequest, ToolWriteRequest
+
+        self.assertEqual(RunCycleRequest().force_next_agent, "brain")
+        self.assertEqual(ToolWriteRequest(target="ac_living_room", value="22.5°C").value, "22.5°C")
+        self.assertEqual(SeedConflictRequest().actor, "agent_security")
+        self.assertFalse(LlmProxyRequest(system_prompt="s", user_prompt="u").enable_reasoning)
+        self.assertEqual(json.loads(CreateSubAgentRequest(agent_definition='{"agent_name": "x"}').agent_definition)["agent_name"], "x")
+
+    def test_le_rotte_principali_sono_registrate(self):
+        from app.api.main import app
+
+        percorsi = {r.path for r in app.routes}
+        for atteso in ("/", "/graph/run", "/tools", "/llm/invoke", "/agents/create", "/graph/health-check", "/graph/resume", "/hitl/config"):
+            self.assertIn(atteso, percorsi)
+
+    async def test_creazione_di_un_sotto_agente(self):
+        risposta = await self.crea({"agent_name": "agent_test", "managed_targets": ["door"]})
+
+        self.assertIn("registered", risposta["status"])
+        self.assertEqual(risposta["agent_name"], "agent_test")
+
+    async def test_json_non_valido_risponde_422(self):
+        with self.assertRaises(HTTPException) as ctx:
+            await self.crea("not json")
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    async def test_campi_obbligatori_mancanti_rispondono_422(self):
+        with self.assertRaises(HTTPException) as ctx:
+            await self.crea({"agent_name": "x"})
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_schemi_hitl(self):
+        from app.api.main import HitlResumeRequest, UnblockTargetRequest
+
+        self.assertEqual(HitlResumeRequest(decision="APPROVA", reasoning="ok").decision, "APPROVA")
+        self.assertEqual(UnblockTargetRequest(target="ac_living_room").target, "ac_living_room")
+
+
+# ── 10. TTL e sblocco ──────────────────────────────────────────────────────────────────────────────────────────
+
+
+class TtlTest(BaseTest):
+    def test_scadenza_dei_flag(self):
+        vecchio = (datetime.now(timezone.utc) - timedelta(minutes=120)).strftime("%Y-%m-%d %H:%M:%S")
+        recente = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        self.assertTrue(is_flag_expired(vecchio, ttl_minutes=60))
+        self.assertFalse(is_flag_expired(recente, ttl_minutes=60))
+
+    async def test_sblocco_ed_espirazione_su_database(self):
+        log = self.log()
+        await log.unblock_target("ac_living_room", "sblocco di prova", actor="test")
+
+        eventi = await log.get_recent_events()
+        scaduti = await log.expire_old_control_flags(ttl_minutes=0)
+
+        self.assertTrue(any(e["action"] == "UNBLOCKED" and e["target"] == "ac_living_room" for e in eventi))
+        self.assertIsInstance(scaduti, int)
+
+
+# ── 11. HITL ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+class HitlTest(BaseTest):
+    async def test_configurazione_dinamica_e_decisione_di_interrupt(self):
+        hitl_manager.update_config(
+            hitl_all=False, hitl_nodes=["organ_security"], hitl_targets=["front_door_lock"],
+            hitl_actions=["FORCE_SHUTDOWN"], max_wait_seconds=120,
         )
-        assert ok, f"force_execute_tool doveva restituire True, ha restituito False: {msg}"
-        val = await pool_tool.get_tool_value()
-        assert val == "ON", f"Pool pump deve essere ON dopo l'override, è invece: {val}"
-        return True
+        cfg = hitl_manager.get_config()
 
-    res, ms = run(timed_async(_test_force_execute()))
-    record("brain_override.force_execute_tool", res, duration_ms=ms)
-except Exception as e:
-    record("brain_override.force_execute_tool", False, traceback.format_exc(limit=3))
+        self.assertEqual((cfg.hitl_nodes, cfg.hitl_targets, cfg.hitl_actions, cfg.max_wait_seconds),
+                         (["organ_security"], ["front_door_lock"], ["FORCE_SHUTDOWN"], 120))
+        self.assertTrue(hitl_manager.should_interrupt("organ_security", {}))
+        self.assertFalse(hitl_manager.should_interrupt("agent_climate", {}))
+        self.assertTrue(hitl_manager.should_interrupt("agent_climate", {}, proposed_target="front_door_lock"))
+        self.assertTrue(hitl_manager.should_interrupt("agent_climate", {}, proposed_action="FORCE_SHUTDOWN"))
 
-# 15b: on-demand tool creation tramite get_tool
-try:
-    async def _test_on_demand_tool():
-        from app.tools.sensor_tools import get_tool, _TOOL_REGISTRY
-        unique_name = "test_on_demand_device_xyz"
-        t = get_tool(unique_name, initial_value="IDLE", unit="status")
-        assert t is not None
-        assert await t.get_tool_value() == "IDLE"
-        await t.set_tool_value("ACTIVE")
-        # Il registry deve restituire la stessa istanza (singleton)
-        t2 = get_tool(unique_name)
-        assert await t2.get_tool_value() == "ACTIVE"
-        return True
+    async def test_max_wait_seconds_si_puo_azzerare(self):
+        hitl_manager.update_config(max_wait_seconds=120)
+        hitl_manager.update_config(hitl_all=False)
+        self.assertEqual(hitl_manager.get_config().max_wait_seconds, 120)
+        hitl_manager.update_config(max_wait_seconds=None)
+        self.assertIsNone(hitl_manager.get_config().max_wait_seconds)
 
-    res, ms = run(timed_async(_test_on_demand_tool()))
-    record("brain_override.on_demand_tool_singleton", res, duration_ms=ms)
-except Exception as e:
-    record("brain_override.on_demand_tool_singleton", False, traceback.format_exc(limit=3))
+    async def test_override_semantico_dal_wrapper_non_scrive_riconciliazioni(self):
+        hitl_manager.update_config(hitl_all=True, hitl_nodes=["brain"])
+        brain = self.usa_db(BrainAgent())
+        stufa = get_tool("heater_override_test", initial_value="OFF", unit="°C")
+        brain.tools["heater_override_test"] = stufa
+        chiamate = []
 
-# 15c: execute_semantic_override fallback su JSON non valido
-try:
-    async def _test_semantic_override_json_fallback():
-        """Se il MAO restituisce una risposta non parsabile, il sistema crea un fallback JSON e lo esegue."""
-        from app.graph.orchestrator import BrainAgent
-        from app.tools.sensor_tools import get_tool
-        from unittest.mock import patch
+        async def override_finto(human_directive, fallback_target, fallback_action):
+            chiamate.append(human_directive)
+            await stufa.set_tool_value("22°C")
+            return ["[Brain_Override] ✓ ESEGUITO — UNBLOCK_AND_SET su 'heater_override_test' → '22°C'"]
 
-        brain = BrainAgent()
-        heater = get_tool("heater_test_ov", initial_value="OFF", unit="°C")
-        brain.tools["heater_test_ov"] = heater
+        brain._execute_semantic_override = override_finto
+        stato = {**STATO_BASE, "hitl_required": True}
 
-        # Mock: MAO restituisce testo non JSON (es. risposta di errore o linguaggio naturale)
-        with patch.object(brain, "ask_brain", return_value="Mi dispiace, non ho capito."):
-            msgs = await brain._execute_semantic_override(
-                human_directive="Accendi il riscaldamento per mia nonna",
-                fallback_target="heater_test_ov",
-                fallback_action="ON",
-            )
-        # Deve aver eseguito il fallback e restituire almeno un messaggio
-        assert len(msgs) > 0
-        # Fallback: il tool deve essere stato impostato
-        val = await heater.get_tool_value()
-        assert val == "ON", f"Heater deve essere ON dopo fallback override, è: {val}"
-        return True
+        with patch("app.graph.builder.interrupt", return_value={"decision": "OVERRIDE", "reasoning": "Accendi la stufa a 22 gradi"}), \
+                patch("app.tools.event_log.EventLog.get_recent_events", AsyncMock(return_value=[])):
+            risultato = await wrap_node_with_hitl("brain", brain)(stato)
 
-    res, ms = run(timed_async(_test_semantic_override_json_fallback()))
-    record("brain_override.semantic_fallback_json", res, duration_ms=ms)
-except Exception as e:
-    record("brain_override.semantic_fallback_json", False, traceback.format_exc(limit=3))
+        self.assertEqual(chiamate, ["Accendi la stufa a 22 gradi"])
+        self.assertEqual(await stufa.get_tool_value(), "22°C")
+        self.assertEqual(risultato["next_agent"], "END")
+        self.assertIn("ESEGUITO", risultato["messages"][-1].content)
 
 
-# ── Output ────────────────────────────────────────────────────────────────
-output_path = ROOT / "test_results.json"
-summary = {
-    "run_at": datetime.now(timezone.utc).isoformat(),
-    "python_version": sys.version,
-    "total": len(results),
-    "passed": sum(1 for r in results if r["passed"]),
-    "failed": sum(1 for r in results if not r["passed"]),
-    "tests": results,
-}
-output_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
-print(f"\n{'='*50}")
-print(f"Risultati: {summary['passed']}/{summary['total']} passati — {summary['failed']} falliti")
-print(f"File: {output_path}")
-if summary["failed"] > 0:
-    print("FALLITI:")
-    for r in results:
-        if not r["passed"]:
-            print(f"  - {r['test']}: {r['detail'][:150]}")
+# ── 12. Gerarchia dinamica ─────────────────────────────────────────────────────────────────────────────────────
+
+
+class GerarchiaTest(BaseTest):
+    async def test_registro_albero_e_istanze(self):
+        registro = AgentRegistry(db_path=self.db)
+        await registro.init_registry_db()
+
+        await registro.register_agent_config({"name": "organ_security", "level": 1, "parent_agent_name": "Brain", "managed_targets": ["alarm_system"], "sub_agent_names": []})
+        await registro.register_agent_config({"name": "component_door_lock", "level": 2, "parent_agent_name": "organ_security", "managed_targets": ["front_door_lock"], "sub_agent_names": []})
+
+        configs = await registro.get_all_agent_configs()
+        organo = next(c for c in configs if c["name"] == "organ_security")
+        albero = await registro.get_hierarchy_tree()
+        istanze = await registro.build_agent_instances()
+
+        self.assertEqual(organo["sub_agent_names"], ["component_door_lock"])  # derivati da parent_agent_name
+        self.assertEqual(albero["root"], "Brain")
+        self.assertIsInstance(istanze["organ_security"], DynamicAgent)
+        self.assertIn("component_door_lock", istanze)
+
+        # i figli si eliminano prima del padre
+        self.assertTrue(await registro.delete_agent("component_door_lock"))
+        self.assertTrue(await registro.delete_agent("organ_security"))
+
+
+# ── 13. Strumenti e agenti medici ──────────────────────────────────────────────────────────────────────────────
+
+
+class MedicoTest(BaseTest):
+    def test_normalizzazione_deterministica(self):
+        normale = deterministic_biometric_normalizer(75.0, 60.0, 100.0)
+        patologico = deterministic_biometric_normalizer(160.0, 60.0, 100.0)
+
+        self.assertTrue(normale["is_in_range"])
+        self.assertEqual(normale["normalized_score"], -0.25)
+        self.assertFalse(patologico["is_in_range"])
+        self.assertEqual(patologico["recommended_target"], 100.0)
+
+    async def test_lettura_e_scrittura_dei_tool_medici(self):
+        cuore, polmone = HeartRateRegulatorTool(), LungVentilatorTool()
+        self.assertEqual(await cuore.get_tool_value(), "72.0 BPM")
+        await cuore.set_tool_value(160.0)
+        self.assertEqual(await cuore.get_tool_value(), "160.0 BPM")
+        self.assertEqual(await polmone.get_tool_value(), "98.0%")
+        await polmone.set_tool_value(82.0)
+        self.assertEqual(await polmone.get_tool_value(), "82.0%")
+
+    async def test_un_flag_di_controllo_non_rompe_i_tool_numerici(self):
+        cuore, polmone = HeartRateRegulatorTool(), LungVentilatorTool()
+        await cuore.set_tool_value(120.0)
+
+        self.assertIs(await cuore.set_tool_value("REJECTED"), True)
+        self.assertIs(await polmone.set_tool_value("BLOCKED"), True)
+
+        self.assertEqual(await cuore.get_tool_value(), "120.0 BPM")
+        self.assertEqual(await polmone.get_tool_value(), "98.0%")
+
+    async def test_un_tool_personalizzato_registrato_lo_trova_anche_il_brain(self):
+        from app.tools.sensor_tools import registra_tool, trova_tool
+
+        cuore = HeartRateRegulatorTool()
+        registra_tool("cardiac_pacemaker", cuore)
+
+        self.assertIs(trova_tool("cardiac_pacemaker", {}), cuore)
+
+    async def test_omeostasi_cardiaca_e_respiratoria(self):
+        cuore, polmone = HeartRateRegulatorTool(), LungVentilatorTool()
+        await cuore.set_tool_value(160.0)
+        await polmone.set_tool_value(82.0)
+        strumenti = {"cardiac_pacemaker": cuore, "oxygen_regulator": polmone}
+        cardio = self.usa_db(CardiovascularOrganAgent(tools=strumenti))
+        respiro = self.usa_db(RespiratoryOrganAgent(tools=strumenti))
+
+        esito_cuore = await cardio({**STATO_BASE, "next_agent": "organ_cardiovascular",
+                                    "readings": [{"sensor_id": "cardiac_pacemaker", "agent_owner": "test", "value": "160.0", "unit": "BPM"}]})
+        await respiro({**STATO_BASE, "next_agent": "organ_respiratory",
+                       "readings": [{"sensor_id": "oxygen_regulator", "agent_owner": "test", "value": "82.0", "unit": "%"}]})
+
+        self.assertEqual(esito_cuore["next_agent"], "brain")  # aritmia severa: escalation al Brain
+        self.assertEqual(len(esito_cuore["pending_escalations"]), 1)
+        self.assertEqual(await polmone.get_tool_value(), "95.0%")  # ipossia: ripristinato il target di SpO2
+
+
+if __name__ == "__main__":
+    unittest.main()

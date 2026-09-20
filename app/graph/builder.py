@@ -7,19 +7,21 @@ import logging
 import time
 from typing import Any
 from langchain_core.messages import AIMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
 from app.agents.agent_climate import ClimateAgent
-from app.graph.hitl_config import hitl_manager
+from app.core.errori_llm import ErroreLLM
+from app.graph.hitl_config import e_decisione_sistema, flusso_nodi_attivo, hitl_manager
 from app.graph.orchestrator import BrainAgent
 from app.graph.state import GraphState
+from app.graph.timer_hitl import attesa_massima_secondi
 from app.tools.sensor_tools import get_default_iot_tools
 
 logger = logging.getLogger(__name__)
-
-from app.checkpointer import get_persistent_checkpointer
 
 
 def _resolve_registered_node(next_node: Any, registered_nodes: set[str]) -> str:
@@ -38,24 +40,58 @@ def _resolve_registered_node(next_node: Any, registered_nodes: set[str]) -> str:
     return END
 
 
+# Per un LLM non utilizzabile non c'è nulla che il sistema possa decidere al posto dell'operatore: SISTEMA annulla il ciclo.
+_PAROLE_DI_RINUNCIA = ("RESPINGI", "REJECT", "ABORT", "ANNULLA", "STOP", "SISTEMA")
+
+
+async def _esegui_con_operatore(node_name: str, esegui):
+    """
+    Esegue `esegui()`. Se il modello LLM non è utilizzabile (ErroreLLM: errore del provider, crediti, chiave, token,
+    risposta vuota) non prosegue con decisioni inventate: mette il grafo in pausa (interrupt) con causa e suggerimento,
+    così l'operatore può cambiare chiave o modello nel .env, ricaricare il piano o risolvere il problema.
+    Alla ripresa (APPROVA / RETRY / qualsiasi decisione diversa da una rinuncia) riprova; con RESPINGI rinuncia.
+    Restituisce (risultato, True) oppure (None, False) se l'operatore ha rinunciato.
+    """
+    while True:
+        try:
+            return await esegui(), True
+        except ErroreLLM as errore:
+            logger.warning(f"[HITL Interceptor] Modello non utilizzabile nel nodo '{node_name}' ({errore.codice}): grafo in pausa.")
+            risposta = interrupt({
+                "type": "llm_failure_human_intervention",
+                "node_name": node_name,
+                "errore": errore.come_dizionario(),
+                "timestamp": time.time(),
+                "prompt": (
+                    f"Il modello non è utilizzabile nel nodo '{node_name}' ({errore.codice}): {errore.messaggio} "
+                    f"{errore.suggerimento} Dopo aver risolto riprendi con APPROVA (o RETRY) per riprovare, "
+                    "oppure RESPINGI per annullare il ciclo."
+                ),
+            })
+            decisione = str(risposta.get("decision", "APPROVA") if isinstance(risposta, dict) else risposta or "APPROVA").upper()
+            if any(parola in decisione for parola in _PAROLE_DI_RINUNCIA):
+                logger.info(f"[HITL Interceptor] Operatore ha rinunciato al nodo '{node_name}' dopo il guasto dell'LLM.")
+                return None, False
+
+
 def wrap_node_with_hitl(node_name: str, agent_obj: Any):
     """
     Wrapper universale che consente di attivare un interrupt HITL (Human-in-the-Loop)
     ovunque nel flusso prima o dopo l'esecuzione del nodo, in base alle regole dinamiche.
     """
     async def hitl_wrapped_agent_node(state: GraphState) -> dict[str, Any]:
-        # 1. Intercettazione PRE-ESECUZIONE del nodo
-        if hitl_manager.should_interrupt(node_name, state):
+        # 1. Intercettazione PRE-ESECUZIONE del nodo (flusso HITL "nodi": [hitl] livello in configurazione.toml)
+        if flusso_nodi_attivo() and hitl_manager.should_interrupt(node_name, state):
             logger.warning(f"[HITL Interceptor] Invocazione interrupt() prima di eseguire il nodo '{node_name}'.")
             cfg = hitl_manager.get_config()
             human_payload = interrupt({
                 "type": "hitl_node_entry_interrupt",
                 "node_name": node_name,
                 "timestamp": time.time(),
-                "max_wait_seconds": cfg.max_wait_seconds,
+                "max_wait_seconds": attesa_massima_secondi(),
                 "prompt": (
                     f"Approvazione Umana Richiesta: esecuzione nodo '{node_name}'. "
-                    f"Attesa max: {cfg.max_wait_seconds or 'illimitata'}s."
+                    f"Attesa max: {attesa_massima_secondi() or 'illimitata'}s."
                 ),
             })
 
@@ -68,7 +104,11 @@ def wrap_node_with_hitl(node_name: str, agent_obj: Any):
             elif human_payload:
                 decision_val = str(human_payload).upper()
 
-            if "RESPINGI" in decision_val or "REJECT" in decision_val or "NO" in decision_val:
+            if e_decisione_sistema(decision_val):
+                # Timer scaduto con azione "sistema": si prosegue come se l'HITL non fosse configurato, il nodo viene eseguito.
+                logger.warning(f"[HITL Interceptor] Nodo '{node_name}': nessuna risposta dell'operatore, decide il sistema ({reasoning}).")
+
+            elif "RESPINGI" in decision_val or "REJECT" in decision_val or "NO" in decision_val:
                 logger.info(f"[HITL Interceptor] Nodo '{node_name}' bloccato da rifiuto umano ({reasoning}).")
                 try:
                     from app.tools.event_log import EventLog
@@ -122,7 +162,10 @@ def wrap_node_with_hitl(node_name: str, agent_obj: Any):
                     # Individua il primo target non ancora riconciliato
                     for e in events:
                         act = str(e.get("action", ""))
-                        if not act.startswith("RESOLVED_") and not act.startswith("RECONCILED_") and not act.startswith("UNBLOCKED"):
+                        if (
+                            not act.startswith("RESOLVED_") and not act.startswith("RECONCILED_") and not act.startswith("UNBLOCKED")
+                            and not act.startswith(("TOOL_ERROR_", "TROUBLESHOOT_RETRY_", "TOOL_FAILURE_", "INVALID_COMMAND_"))
+                        ):
                             fallback_target = e.get("target", fallback_target)
                             fallback_action = e.get("action", fallback_action)
                             break
@@ -133,11 +176,19 @@ def wrap_node_with_hitl(node_name: str, agent_obj: Any):
                 override_msgs: list[str] = []
                 if hasattr(agent_obj, "_execute_semantic_override"):
                     try:
-                        override_msgs = await agent_obj._execute_semantic_override(
-                            human_directive=reasoning,
-                            fallback_target=fallback_target,
-                            fallback_action=fallback_action,
+                        risultato_override, proseguito = await _esegui_con_operatore(
+                            node_name,
+                            lambda: agent_obj._execute_semantic_override(
+                                human_directive=reasoning,
+                                fallback_target=fallback_target,
+                                fallback_action=fallback_action,
+                            ),
                         )
+                        override_msgs = risultato_override if proseguito else [
+                            "[OVERRIDE ANNULLATO] Modello LLM non disponibile: nessun comando eseguito."
+                        ]
+                    except GraphBubbleUp:
+                        raise
                     except Exception as ov_ex:
                         logger.error(f"[HITL Interceptor] Errore durante Semantic Override: {ov_ex}")
                         override_msgs = [f"[OVERRIDE ERROR] {ov_ex}"]
@@ -184,22 +235,31 @@ def wrap_node_with_hitl(node_name: str, agent_obj: Any):
         # 2. Esecuzione dell'agente reale
         # Gli agenti BaseAgent sono callable: passare da __call__ è essenziale perché
         # lì vengono caricati dal DB gli eventi recenti e filtrate letture/escalation.
-        if callable(agent_obj):
-            res = await agent_obj(state)
-        elif callable(getattr(agent_obj, "process", None)):
-            recent_events = state.get("recent_events", [])
-            relevant_readings = state.get("readings", [])
-            agent_escalations = state.get("pending_escalations", [])
-            res = await agent_obj.process(state, recent_events, relevant_readings, agent_escalations)
-        else:
-            res = {}
+        async def esegui_agente() -> dict[str, Any]:
+            if callable(agent_obj):
+                return await agent_obj(state)
+            if callable(getattr(agent_obj, "process", None)):
+                recent_events = state.get("recent_events", [])
+                relevant_readings = state.get("readings", [])
+                agent_escalations = state.get("pending_escalations", [])
+                return await agent_obj.process(state, recent_events, relevant_readings, agent_escalations)
+            return {}
+
+        res, proseguito = await _esegui_con_operatore(node_name, esegui_agente)
+        if not proseguito:
+            return {
+                "messages": [AIMessage(content=f"[HITL Interceptor] Nodo '{node_name}' annullato dall'operatore: modello LLM non disponibile.")],
+                "next_agent": "END",
+            }
 
         # 3. Intercettazione POST-ESECUZIONE per escalation o azioni prodotte
         pending_esc = res.get("pending_escalations", [])
         for esc in pending_esc:
+            if esc.get("resolved"):
+                continue
             t = esc.get("target_device")
             a = esc.get("proposed_action")
-            if hitl_manager.should_interrupt(node_name, state, proposed_target=t, proposed_action=a):
+            if flusso_nodi_attivo() and hitl_manager.should_interrupt(node_name, state, proposed_target=t, proposed_action=a):
                 logger.warning(
                     f"[HITL Interceptor] Invocazione interrupt() post-analisi del nodo '{node_name}' per target '{t}' ({a})."
                 )
@@ -210,10 +270,10 @@ def wrap_node_with_hitl(node_name: str, agent_obj: Any):
                     "target_device": t,
                     "proposed_action": a,
                     "timestamp": time.time(),
-                    "max_wait_seconds": cfg.max_wait_seconds,
+                    "max_wait_seconds": attesa_massima_secondi(),
                     "prompt": (
                         f"Approvazione Umana Richiesta per target '{t}' (Azione: {a}). "
-                        f"Attesa max: {cfg.max_wait_seconds or 'illimitata'}s."
+                        f"Attesa max: {attesa_massima_secondi() or 'illimitata'}s."
                     ),
                 })
 
@@ -223,6 +283,7 @@ def wrap_node_with_hitl(node_name: str, agent_obj: Any):
                 elif human_payload:
                     decision_val = str(human_payload).upper()
 
+                # Solo un rifiuto svuota le escalation: con SISTEMA (timer scaduto) restano e le valuta il Brain.
                 if "RESPINGI" in decision_val or "REJECT" in decision_val or "NO" in decision_val:
                     res["pending_escalations"] = []
                     res["messages"] = [AIMessage(content=f"[HITL Interceptor] Azione proposta su '{t}' respinta da approvazione umana.")]
@@ -232,10 +293,16 @@ def wrap_node_with_hitl(node_name: str, agent_obj: Any):
     return hitl_wrapped_agent_node
 
 
-def build_graph(custom_agent_instances: dict[str, Any] | None = None):
+def build_graph(
+    custom_agent_instances: dict[str, Any] | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
+):
     """
     Costruisce e compila il grafo con topologia ad albero gerarchico (Padre <-> Figlio)
     e wrapper per la gestione dinamica degli Interrupt HITL.
+
+    `checkpointer` salva stato e interrupt (in esecuzione reale è quello SQLite di `app.checkpointer`).
+    Se omesso si usa un `MemorySaver` volatile, adatto solo a test e demo.
     """
     shared_tools = get_default_iot_tools()
 
@@ -281,11 +348,8 @@ def build_graph(custom_agent_instances: dict[str, Any] | None = None):
     for node_id in registered_nodes:
         workflow.add_conditional_edges(node_id, generic_router, routing_map)
 
-    # 5. Checkpointer per la persistenza di stato (usa wrapper persistente su disco)
-    try:
-        checkpointer = get_persistent_checkpointer()
-    except Exception:
-        # Fallback robusto: MemorySaver in-memory
+    # 5. Checkpointer per la persistenza di stato e degli interrupt HITL
+    if checkpointer is None:
         checkpointer = MemorySaver()
     compiled_graph = workflow.compile(checkpointer=checkpointer)
 

@@ -109,6 +109,28 @@ class BlockingRegressionTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await mao.aclose()
 
+    async def test_override_semantico_chiama_il_modello_e_rispetta_il_valore_richiesto(self):
+        from app.tools.sensor_tools import IoTDeviceTool
+
+        serratura = IoTDeviceTool("front_door_lock", initial_value="UNLOCKED")
+        brain = BrainAgent(tools=[serratura])
+        brain.ask_brain = AsyncMock(
+            return_value='[{"target": "front_door_lock", "action": "UNBLOCK_AND_SET", "value": "LOCKED"}]'
+        )
+        brain.event_log.mark_resolved = AsyncMock()
+        brain.event_log.log_event = AsyncMock()
+
+        messaggi = await brain._execute_semantic_override(
+            "Imposta front_door_lock su LOCKED", "front_door_lock", "UNBLOCK_AND_SET"
+        )
+
+        brain.ask_brain.assert_awaited_once()
+        prompt_di_sistema = brain.ask_brain.await_args.args[0]
+        self.assertIn('{"target"', prompt_di_sistema)
+        self.assertIn("front_door_lock", prompt_di_sistema)
+        self.assertEqual(await serratura.get_tool_value(), "LOCKED")
+        self.assertIn("ESEGUITO", messaggi[0])
+
     async def test_health_check_does_not_report_ok_for_control_flags(self):
         brain = BrainAgent(tools=[])
         brain.ask_brain = AsyncMock(return_value="STATUS: OK")

@@ -12,9 +12,11 @@ RUN groupadd --system langbrain \
     && mkdir -p /data \
     && chown -R langbrain:langbrain /app /data
 
-COPY requirements.txt ./
+# Versioni esatte di tutte le dipendenze (requirements.lock): la build è riproducibile.
+COPY requirements.txt requirements.lock ./
 RUN python -m pip install --upgrade pip \
-    && python -m pip install -r requirements.txt
+    && python -m pip install --no-deps -r requirements.lock \
+    && python -m pip check
 
 COPY --chown=langbrain:langbrain . .
 
@@ -25,5 +27,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=3).read()" || exit 1
 
-# Un solo worker: tool registry, HITL manager e MemorySaver sono in memoria di processo.
+# Un solo worker: tool registry e HITL manager sono in memoria di processo (checkpoint e stato HITL pendente stanno su SQLite).
 CMD ["python", "-m", "uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

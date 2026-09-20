@@ -64,23 +64,23 @@ class EventLog:
 
     async def mark_resolved(self, target: str) -> None:
         """
-        Fix 1 — Marca come risolti tutti gli eventi ESCALATION_PROPOSED del target nella finestra corrente.
-        Questo impedisce che i cicli successivi vedano ancora il conflitto come 'attivo' nel DB.
-        L'UPDATE setta escalated = 0 e aggiunge il prefisso RESOLVED_ all'action per escluderli dai
-        controlli di conflitto (check_for_recent_conflict usa actor != self.name, ma la logica in
-        agent_climate ora esclude anche azioni RECONCILED_* e RESOLVED_*).
+        Marca come risolte tutte le escalation ancora aperte del target (qualunque nome abbia l'azione: un agente
+        personalizzato può registrarla come vuole, es. CRITICAL_ARHYTHMIA_ESCALATION). Senza questo il Brain
+        le rivedrebbe come "non riconciliate" a ogni ciclo. L'UPDATE imposta escalated = 0 e antepone RESOLVED_
+        all'azione, così i controlli di conflitto le ignorano.
         """
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 result = await db.execute(
                     """UPDATE events
                        SET action = 'RESOLVED_' || action, escalated = 0
-                       WHERE target = ? AND action = 'ESCALATION_PROPOSED' AND escalated = 1""",
+                       WHERE target = ? AND escalated = 1
+                         AND action NOT LIKE 'RESOLVED\\_%' ESCAPE '\\' AND action NOT LIKE 'RECONCILED\\_%' ESCAPE '\\'""",
                     (target,)
                 )
                 await db.commit()
                 if result.rowcount > 0:
-                    logger.info(f"[EventLog] Marcati {result.rowcount} eventi ESCALATION_PROPOSED come RESOLVED per '{target}'.")
+                    logger.info(f"[EventLog] Marcate {result.rowcount} escalation come RESOLVED per '{target}'.")
         except Exception as e:
             logger.error(f"Errore durante il reset degli eventi di escalation per {target}: {e}")
 

@@ -7,6 +7,7 @@ from app.db.database import Database
 from app.graph.builder import build_graph
 from app.tools.sensor_tools import get_default_iot_tools
 from app.core.constants import is_control_flag
+from app.core.risultati import leggi_tool
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,12 +34,7 @@ class SensorEvent:
 # verrebbe sostituito da un consumer MQTT, WebSocket o webhook.
 # ---------------------------------------------------------------------------
 
-async def sensor_event_producer(
-    event_queue: asyncio.Queue[SensorEvent],
-    shared_tools: dict,
-    poll_interval: float = 5.0,
-    max_events: int | None = None,
-) -> None:
+async def sensor_event_producer(event_queue: asyncio.Queue[SensorEvent], shared_tools: dict, poll_interval: float = 5.0, max_events: int | None = None,) -> None:
     """
     Rileva variazioni nello stato dei tool rispetto all'ultimo valore noto
     e pubblica un SensorEvent nella coda solo quando c'è un cambiamento reale.
@@ -49,7 +45,11 @@ async def sensor_event_producer(
 
     # Lettura iniziale per stabilire il baseline
     for device_id, tool in shared_tools.items():
-        last_known[device_id] = await tool.get_tool_value()
+        lettura = await leggi_tool(tool, device_id)
+        if lettura["success"]:
+            last_known[device_id] = lettura["value"]
+        else:
+            logger.warning("[EventProducer] Lettura iniziale di '%s' non riuscita: %s", device_id, lettura["response"])
 
     logger.info("[EventProducer] Avviato. Monitoring attivo su: %s", list(shared_tools.keys()))
 
@@ -57,7 +57,12 @@ async def sensor_event_producer(
         await asyncio.sleep(poll_interval)
 
         for device_id, tool in shared_tools.items():
-            current = await tool.get_tool_value()
+            lettura = await leggi_tool(tool, device_id)
+            if not lettura["success"]:
+                # Un dispositivo guasto non ferma il monitoraggio degli altri: il baseline resta invariato.
+                logger.warning("[EventProducer] Lettura di '%s' non riuscita: %s", device_id, lettura["response"])
+                continue
+            current = lettura["value"]
             previous = last_known.get(device_id)
 
             if current != previous:
@@ -93,10 +98,7 @@ async def sensor_event_producer(
 # Loop Principale Event-Driven
 # ---------------------------------------------------------------------------
 
-async def run_agent_loop(
-    health_check_interval: float = 30.0,
-    max_iterations: int | None = 3,
-) -> None:
+async def run_agent_loop(health_check_interval: float = 30.0, max_iterations: int | None = 3,) -> None:
     """
     Loop principale event-driven.
     - Il grafo viene invocato SOLO quando arriva un SensorEvent nella coda.

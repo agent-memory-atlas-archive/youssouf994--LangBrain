@@ -8,7 +8,32 @@ import logging
 from typing import Any
 from pydantic import BaseModel, Field
 
+from app.core.configurazione import (
+    HITL_LIVELLO_BRAIN, HITL_LIVELLO_ENTRAMBI, HITL_LIVELLO_NODI, get_configurazione,
+)
+
 logger = logging.getLogger(__name__)
+
+# Decisione con cui il timer scaduto restituisce la richiesta al sistema: il Brain valuta con il suo modello, come senza HITL.
+DECISIONE_SISTEMA = "SISTEMA"
+
+
+def flusso_nodi_attivo() -> bool:
+    """True se il livello HITL configurato include il flusso sui nodi del grafo (wrapper)."""
+    return get_configurazione().hitl_livello in (HITL_LIVELLO_NODI, HITL_LIVELLO_ENTRAMBI)
+
+
+def flusso_brain_attivo() -> bool:
+    """True se il livello HITL configurato include il flusso sul Brain (approvazione delle escalation)."""
+    return get_configurazione().hitl_livello in (HITL_LIVELLO_BRAIN, HITL_LIVELLO_ENTRAMBI)
+
+
+def e_decisione_sistema(decisione: object) -> bool:
+    return DECISIONE_SISTEMA in str(decisione).upper()
+
+
+# Distingue "parametro non indicato" (nessuna modifica) da None (azzera il valore).
+NON_IMPOSTATO: Any = object()
 
 
 class HitlConfigSchema(BaseModel):
@@ -22,7 +47,10 @@ class HitlConfigSchema(BaseModel):
     hitl_actions: list[str] = Field(default_factory=list)
     """Lista delle azioni specifiche che richiedono approvazione umana (es. ['FORCE_SHUTDOWN', 'UNLOCK'])."""
     max_wait_seconds: int | None = Field(default=None)
-    """Attesa massima in secondi prima dell'eventuale fallback automatico."""
+    """
+    Durata in secondi del timer HITL. Vale solo se il timer è attivo in configurazione.toml ([hitl] timer_attivo = 1) e
+    sostituisce `timer_predefinito_secondi`; con null si torna al valore predefinito. Se il timer è spento è solo un metadato.
+    """
     allow_override: bool = True
     """Se False, le direttive OVERRIDE inviate dall'operatore vengono ignorate: utile per disabilitare 'God Mode' in produzione."""
 
@@ -46,9 +74,10 @@ class HitlConfigManager:
         hitl_nodes: list[str] | None = None,
         hitl_targets: list[str] | None = None,
         hitl_actions: list[str] | None = None,
-        max_wait_seconds: int | None = None,
+        max_wait_seconds: int | None = NON_IMPOSTATO,
         allow_override: bool | None = None,
     ) -> HitlConfigSchema:
+        """Aggiorna solo i parametri indicati. `max_wait_seconds=None` azzera l'attesa massima."""
         if hitl_all is not None:
             self.config.hitl_all = hitl_all
         if hitl_nodes is not None:
@@ -57,7 +86,7 @@ class HitlConfigManager:
             self.config.hitl_targets = hitl_targets
         if hitl_actions is not None:
             self.config.hitl_actions = hitl_actions
-        if max_wait_seconds is not None:
+        if max_wait_seconds is not NON_IMPOSTATO:
             self.config.max_wait_seconds = max_wait_seconds
         if allow_override is not None:
             self.config.allow_override = allow_override

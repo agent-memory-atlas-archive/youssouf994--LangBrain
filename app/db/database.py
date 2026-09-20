@@ -2,6 +2,8 @@ import aiosqlite
 import os
 import logging
 
+from app.core.configurazione import get_configurazione
+
 logger = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("DB_PATH", "langbrain.db")
@@ -64,28 +66,22 @@ class Database:
                     )
                 """)
 
-                # 5. Seed / Reset dell'evento di conflitto di test
-                # Elimina vecchi eventi di test simili per evitare accumuli a ogni riavvio
-                await db.execute(
-                    "DELETE FROM events WHERE actor = 'agent_security' AND target = 'ac_living_room'"
-                )
-
-                # Inserisce l'evento in contrasto generato dalla sicurezza
-                await db.execute("""
-                    INSERT INTO events (actor, action, target, old_value, new_value, reasoning, escalated)
-                    VALUES (
-                        'agent_security', 
-                        'FORCE_SHUTDOWN', 
-                        'ac_living_room', 
-                        '22.5°C', 
-                        'OFF', 
-                        'Simulazione: Finestra Aperta!', 
-                        0
+                # 5. Conflitto dimostrativo: solo se richiesto da configurazione.toml ([demo] conflitto_all_avvio = 1).
+                # Di default il database non riceve dati di prova in automatico.
+                if get_configurazione().demo_conflitto_all_avvio:
+                    # Elimina vecchi eventi di test simili per evitare accumuli a ogni riavvio
+                    await db.execute(
+                        "DELETE FROM events WHERE actor = 'agent_security' AND target = 'ac_living_room'"
                     )
-                """)
+                    await db.execute("""
+                        INSERT INTO events (actor, action, target, old_value, new_value, reasoning, escalated)
+                        VALUES ('agent_security', 'FORCE_SHUTDOWN', 'ac_living_room', '22.5°C', 'OFF',
+                                'Simulazione: Finestra Aperta!', 0)
+                    """)
+                    logger.info("Conflitto dimostrativo inserito su 'events' ([demo] conflitto_all_avvio = 1).")
 
                 await db.commit()
-                logger.info("Database SQLite inizializzato e seed del conflitto su 'events' inserito con successo.")
+                logger.info("Database SQLite inizializzato.")
 
         except Exception as e:
             logger.error(f"Errore durante l'inizializzazione/migrazione del database: {e}")

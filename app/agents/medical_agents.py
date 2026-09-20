@@ -8,6 +8,7 @@ from typing import Any
 from langchain_core.messages import AIMessage
 
 from app.agents.base_agent import BaseAgent
+from app.core.risultati import e_guasto_tool
 from app.graph.state import GraphState
 from app.tools.medical_tools import HeartRateRegulatorTool, LungVentilatorTool
 
@@ -67,7 +68,7 @@ class CardiovascularOrganAgent(BaseAgent):
                 }
 
             # Altrimenti applica direttamente il ripristino omeostatico
-            applied = await self.apply_status(
+            risultato = await self.applica_stato(
                 target="cardiac_pacemaker",
                 action="HOMEOSTASIS_BPM_RESTORATION",
                 new_value=target_bpm,
@@ -75,9 +76,15 @@ class CardiovascularOrganAgent(BaseAgent):
                 escalated=False,
                 tools_map=self.tools,
             )
+            if e_guasto_tool(risultato):
+                return {
+                    "next_agent": "brain",
+                    "pending_escalations": [await self.escala_da_risultato(risultato, proposed_action=target_bpm)],
+                    "messages": [AIMessage(content=f"[{self.name}] Guasto del pacemaker: {risultato['response']}. Escalation inviata al Cervello.")],
+                }
             return {
                 "next_agent": "END",
-                "messages": [AIMessage(content=f"[{self.name}] Omeostasi Cardiaca Ripristinata: {norm_result['raw_value']} -> {target_bpm} (applied={applied}).")],
+                "messages": [AIMessage(content=f"[{self.name}] Omeostasi Cardiaca Ripristinata: {norm_result['raw_value']} -> {target_bpm} (applied={risultato['success']}).")],
             }
 
         return {
@@ -115,7 +122,7 @@ class RespiratoryOrganAgent(BaseAgent):
             target_spo2 = f"{norm_result['recommended_target']}%"
             reasoning = f"Patologia Ipossia acuta rilevata (SpO2={norm_result['raw_value']}%). Ripristino ventilazione target a {target_spo2}."
 
-            applied = await self.apply_status(
+            risultato = await self.applica_stato(
                 target="oxygen_regulator",
                 action="HOMEOSTASIS_OXYGEN_RESTORATION",
                 new_value=target_spo2,
@@ -123,9 +130,15 @@ class RespiratoryOrganAgent(BaseAgent):
                 escalated=False,
                 tools_map=self.tools,
             )
+            if e_guasto_tool(risultato):
+                return {
+                    "next_agent": "brain",
+                    "pending_escalations": [await self.escala_da_risultato(risultato, proposed_action=target_spo2)],
+                    "messages": [AIMessage(content=f"[{self.name}] Guasto del ventilatore: {risultato['response']}. Escalation inviata al Cervello.")],
+                }
             return {
                 "next_agent": "END",
-                "messages": [AIMessage(content=f"[{self.name}] Omeostasi Respiratoria Ripristinata: {norm_result['raw_value']}% -> {target_spo2} (applied={applied}).")],
+                "messages": [AIMessage(content=f"[{self.name}] Omeostasi Respiratoria Ripristinata: {norm_result['raw_value']}% -> {target_spo2} (applied={risultato['success']}).")],
             }
 
         return {

@@ -1,9 +1,23 @@
 from abc import ABC, abstractmethod
+import copy
+import json
 import logging
+import re
 from typing import Any
 
+from app.core.configurazione import get_configurazione
+from app.core.modelli_agenti import risolvi_modello
+from app.core.errori_llm import (
+    ErroreLLM, ISTRUZIONE_ERRORE_STANDARD, classifica_errore, interpreta_risposta_standard,
+)
+from app.core.priorita import NOME_BRAIN, priorita_attore, registra_priorita, trova_blocco_prevalente
+from app.core.risultati import (
+    APPLICATO, COMANDO_NON_AMMESSO, RESPINTO_PRIORITA, SOLO_LOG, TOOL_ASSENTE, TOOL_ERRORE, GIA_IMPOSTATO,
+    comanda_tool, e_comando_non_ammesso, e_guasto_tool, leggi_tool, nuovo_risultato,
+)
 from app.graph.state import GraphState, EscalationItem
 from app.tools.event_log import EventLog
+from app.tools.sensor_tools import trova_tool
 from app.MAO.model_access_object import Mao
 
 logger = logging.getLogger(__name__)
@@ -19,6 +33,7 @@ class BaseAgent(ABC):
         self.managed_targets = managed_targets
         self.conflict_window_minutes = conflict_window_minutes
         self.priority_weight = priority_weight
+        registra_priorita(name, priority_weight)
         self.mao = Mao()
         self.event_log = EventLog(target=managed_targets, frequency=conflict_window_minutes)
 
@@ -77,138 +92,130 @@ class BaseAgent(ABC):
 
     async def check_priority_lock(self, target: str) -> tuple[bool, str]:
         """
-        Verifica se c'è un blocco attivo sul target impostato da un agente a priorità superiore (es. Sicurezza=500.0 vs Clima=1.0).
+        Verifica se sul target c'è un blocco attivo imposto da un attore con priorità strettamente maggiore
+        (es. Sicurezza=500.0 vs Clima=1.0). Restituisce (consentito, motivo del rifiuto).
         """
         try:
             events = await self.event_log.get_recent_events()
-            for event in events:
-                if event.get("target") == target:
-                    action = str(event.get("action", ""))
-                    new_val = str(event.get("new_value", "")).upper()
-                    actor = str(event.get("actor", ""))
-
-                    if action.startswith("EXPIRED_") or action.startswith("RESOLVED_") or action.startswith("UNBLOCKED") or action.startswith("RECONCILED_"):
-                        continue
-
-                    from app.core.constants import is_flag_expired, is_control_flag
-                    ts = str(event.get("timestamp", ""))
-                    if is_flag_expired(ts, ttl_minutes=self.conflict_window_minutes):
-                        continue
-
-                    # Solo consideriamo blocchi imposti da attori diversi dall'agente corrente
-                    if actor and actor != self.name and (action in ["FORCE_SHUTDOWN", "SECURITY_LOCK"] or is_control_flag(new_val) or new_val == "OFF"):
-                        # Recupera il peso di priorità dell'attore (se registrato)
-                        actor_weight = None
-                        try:
-                            # Import locale per evitare cicli
-                            from app.agents.agent_registry import AgentRegistry
-                            registry = AgentRegistry(db_path=self.event_log.db_path)
-                            configs = await registry.get_all_agent_configs()
-                            for cfg in configs:
-                                if str(cfg.get("name")) == actor:
-                                    actor_weight = float(cfg.get("priority_weight", 1.0))
-                                    break
-                        except Exception:
-                            # Se non riusciamo a leggere il registro non falliamo il controllo: consideriamo l'attore come "alto" per sicurezza
-                            actor_weight = None
-
-                        # Brain ha per design priorità massima
-                        if actor == "Brain":
-                            actor_weight = float("inf")
-
-                        # Se abbiamo un peso e questo è maggiore del peso dell'agente corrente, allora il blocco tiene
-                        try:
-                            if actor_weight is None:
-                                # comportamento conservativo: se non conosciamo il peso, consideriamo il blocco valido
-                                return False, f"Dispositivo '{target}' bloccato da '{actor}' con azione '{action}' ({new_val})"
-                            if float(actor_weight) > float(self.priority_weight):
-                                return False, f"Dispositivo '{target}' bloccato da '{actor}' (priorità {actor_weight} > {self.priority_weight})"
-                        except Exception:
-                            return False, f"Dispositivo '{target}' bloccato da '{actor}' con azione '{action}' ({new_val})"
+            motivo = trova_blocco_prevalente(events, target, self.name, self.priority_weight, self.conflict_window_minutes)
+            if motivo:
+                return False, motivo
         except Exception as e:
             logger.error(f"[{self.name}] Errore durante la verifica dei blocchi di priorità: {e}")
 
         return True, ""
 
-    async def apply_status(
-        self, 
-        target: str, 
-        action: str, 
-        new_value: str, 
-        reasoning: str, 
+    async def applica_stato(
+        self,
+        target: str,
+        action: str,
+        new_value: str,
+        reasoning: str,
         escalated: bool = False,
-        tools_map: dict[str, Any] | None = None
-    ) -> bool:
+        tools_map: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """
-        Metodo unificato per azionare i tool reali e registrare la transizione old_value -> new_value su DB.
-        Include prevenzione delle esecuzioni ridondanti e controllo dei blocchi a priorità superiore.
-        Ritorna True se l'azione è stata effettivamente applicata, False se saltata o respinta.
+        Aziona il tool reale e registra la transizione old_value -> new_value su DB, con prevenzione delle
+        esecuzioni ridondanti e controllo dei blocchi a priorità superiore.
+        Non solleva mai: restituisce un dizionario (vedi app.core.risultati) con `status`, `response` (il motivo in
+        chiaro) e, se il dispositivo è guasto, `error_type`, così il padre può fare troubleshooting o escalation.
+        L'esito dell'attuazione (`success`) è separato da quello della registrazione su audit log (`audit_logged`).
         """
         old_value = "UNKNOWN"
-        tool_obj = tools_map.get(target) if tools_map else None
-        applied_ok = True
+        tool_obj = trova_tool(target, tools_map)
+        dettagli: dict[str, Any] = {}
+
+        def esito(status: str, response: str, **extra: Any) -> dict[str, Any]:
+            return nuovo_risultato(
+                target, status, response, actor=self.name, action=action,
+                old_value=old_value, requested_value=new_value, **extra,
+            )
+
+        async def registra(azione_evento: str, valore: Any, motivo: str, escalata: bool = False) -> bool:
+            try:
+                await self.event_log.log_event(
+                    actor=self.name, action=azione_evento, target=target, old_value=old_value,
+                    new_value=str(valore), reasoning=motivo, escalated=escalata,
+                )
+                return True
+            except Exception as e:
+                logger.error(f"[{self.name}] Errore durante il salvataggio su DB: {e}")
+                return False
+
+        # 0. Il comando deve essere ammesso dall'elenco dei dispositivi di configurazione.toml
+        validazione = get_configurazione().valida_comando(target, new_value)
+        if not validazione.ammesso:
+            logger.warning(f"[{self.name}] Comando RIFIUTATO su '{target}': {validazione.motivo}")
+            audit = await registra(f"INVALID_COMMAND_{action}", "INVALID", validazione.motivo)
+            return esito(COMANDO_NON_AMMESSO, validazione.motivo, audit_logged=audit)
+        new_value = validazione.valore
 
         # 1. Legge il valore attuale reale dal tool
         if tool_obj:
-            try:
-                old_value = str(await tool_obj.get_tool_value())
-            except Exception as e:
-                logger.error(f"[{self.name}] Errore lettura stato dal tool {target}: {e}")
+            lettura = await leggi_tool(tool_obj, target)
+            if lettura["success"]:
+                old_value = str(lettura["value"])
+            else:
+                dettagli["lettura"] = lettura["response"]
+                logger.warning(f"[{self.name}] Lettura stato dal tool {target} fallita: {lettura['response']}")
 
         # 2. Controllo blocchi a priorità superiore nel DB
-        if self.name != "Brain" and not action.startswith("RECONCILED_") and not action.startswith("UNBLOCKED"):
+        if self.name != NOME_BRAIN and not action.startswith("RECONCILED_") and not action.startswith("UNBLOCKED"):
             allowed, block_msg = await self.check_priority_lock(target)
             if not allowed:
                 logger.warning(f"[{self.name}] Azione RESPINTA su '{target}': {block_msg}")
-                try:
-                    await self.event_log.log_event(
-                        actor=self.name,
-                        action=f"REJECTED_{action}",
-                        target=target,
-                        old_value=old_value,
-                        new_value="REJECTED",
-                        reasoning=f"Azione respinta da vincolo di priorità superiore: {block_msg}",
-                        escalated=False,
-                    )
-                except Exception as e:
-                    logger.error(f"[{self.name}] Errore salvataggio REJECTED su DB: {e}")
-                return False
+                audit = await registra(
+                    f"REJECTED_{action}", "REJECTED", f"Azione respinta da vincolo di priorità superiore: {block_msg}"
+                )
+                return esito(RESPINTO_PRIORITA, block_msg, audit_logged=audit)
 
         # 3. Controllo Ridondanza: se il tool è GIÀ al valore desiderato, non rieseguire!
         if old_value.upper() == str(new_value).upper() and not escalated:
             logger.info(f"[{self.name}] Saltata azione su '{target}': valore attuale già a '{old_value}'. In fase di stabilizzazione.")
-            return False
+            return esito(GIA_IMPOSTATO, f"'{target}' è già al valore '{old_value}'.")
 
         # 4. Azionamento del Tool
         if tool_obj:
-            try:
-                await tool_obj.set_tool_value(new_value)
-                logger.info(f"[{self.name}] Tool '{target}' azionato: {old_value} -> {new_value}")
-            except Exception as e:
-                logger.error(f"[{self.name}] Errore durante l'azionamento del tool '{target}': {e}")
-                applied_ok = False
-        else:
-            # Se non esiste il tool e non siamo in un'escalation, consideriamo il tentativo come non applicato
-            if not escalated:
-                logger.warning(f"[{self.name}] Tool '{target}' non trovato nella mappa tools: azione non applicata.")
-                applied_ok = False
+            comando = await comanda_tool(tool_obj, target, new_value)
+            if not comando["success"]:
+                logger.error(f"[{self.name}] Errore durante l'azionamento del tool '{target}': {comando['response']}")
+                audit = await registra(
+                    f"TOOL_ERROR_{action}", "FAILED", f"Guasto del dispositivo '{target}': {comando['response']}"
+                )
+                return esito(
+                    TOOL_ERRORE, comando["response"], error_type=comando.get("error_type"),
+                    details={**dettagli, **(comando.get("details") or {})} or None, audit_logged=audit,
+                )
+            logger.info(f"[{self.name}] Tool '{target}' azionato: {old_value} -> {new_value}")
+        elif not escalated:
+            # Senza tool e fuori da un'escalation l'azione non può essere applicata.
+            messaggio = f"Tool '{target}' non trovato nella mappa dei tool."
+            logger.warning(f"[{self.name}] {messaggio} Azione non applicata.")
+            audit = await registra(f"TOOL_ERROR_{action}", "FAILED", messaggio)
+            return esito(TOOL_ASSENTE, messaggio, error_type="TOOL_MISSING", audit_logged=audit)
 
         # 5. Registrazione dell'evento con old_value e new_value nel DB SQLite
-        try:
-            await self.event_log.log_event(
-                actor=self.name,
-                action=action,
-                target=target,
-                old_value=old_value,
-                new_value=str(new_value),
-                reasoning=reasoning,
-                escalated=escalated
-            )
-        except Exception as e:
-            logger.error(f"[{self.name}] Errore durante il salvataggio su DB: {e}")
-            applied_ok = False
+        audit = await registra(action, new_value, reasoning, escalated)
+        risposta = f"'{target}': {old_value} -> {new_value}."
+        if not audit:
+            risposta += " Attenzione: registrazione su audit log non riuscita."
+        return esito(APPLICATO if tool_obj else SOLO_LOG, risposta, details=dettagli or None, audit_logged=audit)
 
-        return applied_ok
+    async def apply_status(
+        self,
+        target: str,
+        action: str,
+        new_value: str,
+        reasoning: str,
+        escalated: bool = False,
+        tools_map: dict[str, Any] | None = None,
+    ) -> bool:
+        """
+        Versione booleana di `applica_stato`: True se l'azione è stata applicata, False se saltata, respinta o fallita.
+        Chi deve conoscere il motivo di un fallimento usa `applica_stato`.
+        """
+        risultato = await self.applica_stato(target, action, new_value, reasoning, escalated, tools_map)
+        return risultato["status"] in (APPLICATO, SOLO_LOG)
 
     def check_for_recent_conflict(self, target: str, recent_events: list[dict], ignore_actor: str | None = None) -> tuple[bool, dict | None]:
         """
@@ -234,9 +241,18 @@ class BaseAgent(ABC):
                     return True, event
         return False, None
 
-    def create_escalation(self, target_device: str, proposed_action: str, reason: str, conflict_detected: bool = False, context_events: list[dict] | None = None):
+    def create_escalation(
+        self,
+        target_device: str,
+        proposed_action: str,
+        reason: str,
+        conflict_detected: bool = False,
+        context_events: list[dict] | None = None,
+        tool_result: dict[str, Any] | None = None,
+    ):
         """
         Helper per costruire un oggetto EscalationItem pronto da inserire nello stato.
+        `tool_result` porta con sé l'esito strutturato di un'attuazione fallita.
         """
         item = EscalationItem(
             source_agent=self.name,
@@ -244,9 +260,163 @@ class BaseAgent(ABC):
             proposed_action=proposed_action,
             reason=reason,
             conflict_detected=conflict_detected,
-            context_events=context_events or []
+            context_events=context_events or [],
+            tool_result=tool_result,
         )
         return item.model_dump()
+
+    async def escala_da_risultato(self, risultato: dict[str, Any], proposed_action: str) -> dict[str, Any]:
+        """
+        Crea l'escalation per un'attuazione non riuscita. Per un guasto del dispositivo l'escalation porta il
+        risultato strutturato (con il motivo) e viene registrata sull'audit log; per una priorità insufficiente
+        riporta il vincolo che ha respinto l'azione.
+        """
+        target = risultato["device_name"]
+        guasto = e_guasto_tool(risultato)
+        if guasto:
+            reason = f"Guasto del dispositivo '{target}' rilevato da {self.name}: {risultato['response']}"
+        elif e_comando_non_ammesso(risultato):
+            reason = f"Comando di {self.name} su '{target}' non ammesso: {risultato['response']}"
+        else:
+            reason = f"Azione su {target} bloccata da vincolo di priorità per {self.name}: {risultato['response']}"
+        escalation = self.create_escalation(
+            target_device=target,
+            proposed_action=proposed_action,
+            reason=reason,
+            conflict_detected=True,
+            context_events=[],
+            tool_result=risultato if guasto else None,
+        )
+        if guasto:
+            try:
+                await self.event_log.log_event(
+                    actor=self.name, action="ESCALATION_PROPOSED", target=target,
+                    old_value=str(risultato.get("old_value", "UNKNOWN")), new_value=str(proposed_action),
+                    reasoning=reason, escalated=True,
+                )
+            except Exception as e:
+                logger.error(f"[{self.name}] Errore salvataggio ESCALATION_PROPOSED su DB: {e}")
+        return escalation
+
+    # --- Troubleshooting dei guasti segnalati dai sotto-agenti -------------------------------------------------
+
+    _PROMPT_TROUBLESHOOTING = (
+        "Sei il modulo di troubleshooting di un sistema IoT gerarchico. Un dispositivo non ha eseguito un comando: "
+        "il primo fallimento è il motivo per cui vieni interpellato e, da solo, NON dimostra che il guasto sia permanente.\n"
+        "Regole di decisione:\n"
+        "- Scegli RETRY se l'errore è di tipo transitorio (timeout, rete, disturbo momentaneo, risorsa occupata) e "
+        "i ritenti di troubleshooting già falliti sono 0.\n"
+        "- Scegli ESCALATE se l'errore indica un guasto permanente (hardware rotto, dispositivo inesistente, comando "
+        "non valido, credenziali) oppure se almeno un ritento di troubleshooting è già fallito.\n"
+        "Rispondi ESATTAMENTE nel formato:\n"
+        "DIAGNOSI: [causa probabile e azione consigliata]\n"
+        "DECISIONE: [RETRY|ESCALATE]"
+    )
+
+    @staticmethod
+    def _agenti_che_hanno_tentato(escalation: dict[str, Any]) -> set[str]:
+        tentativi = (escalation.get("tool_result") or {}).get("attempts", [])
+        return {str(t.get("agent")) for t in tentativi}
+
+    def puo_fare_troubleshooting(self, escalation: dict[str, Any]) -> bool:
+        """
+        L'agente interviene su un guasto solo se ha priorità almeno pari a quella di chi lo ha segnalato
+        (il Brain sempre) e non ha già provato a risolverlo: ogni agente tenta al massimo una volta.
+        """
+        if not e_guasto_tool(escalation.get("tool_result")):
+            return False
+        segnalante = str(escalation.get("source_agent"))
+        if segnalante == self.name or self.name in self._agenti_che_hanno_tentato(escalation):
+            return False
+        if self.name == NOME_BRAIN:
+            return True
+        return self.priority_weight >= (priorita_attore(segnalante) or 0.0)
+
+    async def risolvi_guasto_tool(self, escalation: dict[str, Any], tools_map: dict[str, Any] | None) -> dict[str, Any]:
+        """
+        Diagnostica un guasto con il modello, a partire dall'errore e dallo storico del dispositivo, ed
+        eventualmente ritenta una volta il comando (sottoposto al controllo di priorità dell'agente).
+        Restituisce {resolved, diagnosis, decision, tool_result}: `tool_result` è aggiornato con diagnosi e tentativo.
+        """
+        tool_result = copy.deepcopy(escalation["tool_result"])
+        tool_result.setdefault("attempts", [])
+        device = tool_result["device_name"]
+        valore = tool_result.get("requested_value", escalation.get("proposed_action"))
+
+        try:
+            storico = await EventLog(target=[device], frequency=60).get_recent_events()
+        except Exception as e:
+            logger.warning(f"[{self.name}] Storico del dispositivo '{device}' non disponibile: {e}")
+            storico = []
+        storico_sintetico = [
+            {k: ev.get(k) for k in ("timestamp", "actor", "action", "old_value", "new_value")} for ev in storico[:10]
+        ]
+        ritenti_falliti = sum(
+            1 for t in tool_result["attempts"]
+            if t.get("phase") == "troubleshooting" and t.get("status") in ("TOOL_ERROR", "TOOL_MISSING")
+        )
+        prompt_utente = (
+            f"Dispositivo: {device}\n"
+            f"Esito del comando fallito: {json.dumps({k: v for k, v in tool_result.items() if k != 'attempts'}, ensure_ascii=False, default=str)}\n"
+            f"Ritenti di troubleshooting già falliti: {ritenti_falliti}\n"
+            f"Tentativi già fatti: {json.dumps(tool_result['attempts'], ensure_ascii=False, default=str)}\n"
+            f"Storico recente del dispositivo: {json.dumps(storico_sintetico, ensure_ascii=False, default=str)}\n"
+            "Qual è la diagnosi e la decisione?"
+        )
+        risposta = await self.ask_brain(self._PROMPT_TROUBLESHOOTING, prompt_utente, temperature=0.0, max_tokens=2048)
+        diagnosi, decisione = self._interpreta_diagnosi(risposta)
+        logger.info(f"[{self.name}] Troubleshooting su '{device}': decisione={decisione}. {diagnosi}")
+
+        tentativo: dict[str, Any] = {"agent": self.name, "phase": "troubleshooting", "decision": decisione}
+        risolto = False
+        if decisione == "RETRY":
+            esito = await self.applica_stato(
+                target=device,
+                action=f"TROUBLESHOOT_RETRY_{tool_result.get('action', 'ACTION')}",
+                new_value=valore,
+                reasoning=f"Nuovo tentativo dopo diagnosi: {diagnosi}",
+                escalated=False,
+                tools_map=tools_map,
+            )
+            tentativo.update(status=esito["status"], response=esito["response"])
+            risolto = bool(esito["success"])
+        else:
+            tentativo.update(status="NOT_ATTEMPTED", response="Nessun nuovo tentativo: la diagnosi consiglia l'escalation.")
+        tool_result["attempts"].append(tentativo)
+        tool_result["diagnosis"] = diagnosi
+
+        if risolto:
+            try:
+                await self.event_log.mark_resolved(device)
+            except Exception as e:
+                logger.warning(f"[{self.name}] Impossibile chiudere le escalation di '{device}': {e}")
+        return {"resolved": risolto, "diagnosis": diagnosi, "decision": decisione, "tool_result": tool_result}
+
+    @staticmethod
+    def estrai_decisione(risposta: str, ammesse: tuple[str, ...]) -> str | None:
+        """
+        Legge `DECISIONE: <valore>` dalla risposta del modello tollerando il markdown (`**`, backtick, corsivo).
+        Restituisce il valore in maiuscolo, oppure None se non c'è una decisione riconoscibile tra `ammesse`.
+        """
+        pulita = re.sub(r"[*_`]", "", risposta or "")
+        trovata = re.search(r"DECISIONE:\s*(" + "|".join(map(re.escape, ammesse)) + r")\b", pulita, re.IGNORECASE)
+        return trovata.group(1).upper() if trovata else None
+
+    @staticmethod
+    def decisione_non_riconosciuta(risposta: str) -> ErroreLLM:
+        """Errore per una risposta senza una decisione valida: il grafo si ferma per l'operatore invece di assumere 'nessuna azione'."""
+        return ErroreLLM(
+            "RISPOSTA_NON_UTILIZZABILE",
+            f"Il modello non ha indicato una decisione riconoscibile: {(risposta or '').strip()[:160]!r}",
+        )
+
+    @staticmethod
+    def _interpreta_diagnosi(risposta: str) -> tuple[str, str]:
+        testo = (risposta or "").strip()
+        decisione = "RETRY" if re.search(r"DECISIONE:\s*RETRY", testo, re.IGNORECASE) else "ESCALATE"
+        trovata = re.search(r"DIAGNOSI:\s*(.*?)(?:\n\s*DECISIONE:|$)", testo, re.IGNORECASE | re.DOTALL)
+        diagnosi = (trovata.group(1) if trovata else testo).strip() or "Diagnosi non fornita dal modello."
+        return diagnosi, decisione
 
     async def ask_brain(
         self,
@@ -259,11 +429,30 @@ class BaseAgent(ABC):
     ) -> str:
         """
         Invocazione centralizzata del modello tramite MAO.
+        Solleva ErroreLLM se il modello non è utilizzabile (errore del provider, crediti, chiave, token, risposta
+        vuota) o se dichiara di non poter rispondere: non restituisce mai un errore mascherato da risposta, così
+        nessun agente prende decisioni sulla base di un testo d'errore. Il grafo si ferma per l'operatore (HITL).
         """
+        prompt_di_sistema = f"{system_prompt}\n\n{ISTRUZIONE_ERRORE_STANDARD}"
+        if provider is None and model is None:
+            # Modello specifico dell'agente, ereditato dal padre se non impostato (vedi app.core.modelli_agenti).
+            modello_agente = await risolvi_modello(self.name)
+            provider, model = modello_agente.provider, modello_agente.model
         try:
-            return await self.mao.call_model(
-                system_prompt, user_prompt, temperature, max_tokens, provider=provider, model=model
+            risposta = await self.mao.call_model(
+                prompt_di_sistema, user_prompt, temperature, max_tokens,
+                provider=provider, model=model, rigenera_se_troncata=True,
             )
+        except ErroreLLM as e:
+            logger.error(f"[{self.name}] Modello non utilizzabile ({e.codice}): {e.messaggio}")
+            raise
         except Exception as e:
-            logger.error(f"[{self.name}] Errore nell'invocazione del modello: {e}")
-            return f"Errore nell'invocazione del modello: {str(e)}"
+            codice, messaggio = classifica_errore(e)
+            logger.error(f"[{self.name}] Errore nell'invocazione del modello ({codice}): {messaggio}")
+            raise ErroreLLM(codice, messaggio) from e
+
+        motivo = interpreta_risposta_standard(risposta)
+        if motivo is not None:
+            logger.error(f"[{self.name}] Il modello ha dichiarato di non poter rispondere: {motivo}")
+            raise ErroreLLM("RISPOSTA_NON_UTILIZZABILE", motivo)
+        return risposta

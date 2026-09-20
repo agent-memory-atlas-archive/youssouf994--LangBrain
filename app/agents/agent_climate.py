@@ -4,6 +4,7 @@ from langchain_core.messages import AIMessage
 
 from app.agents.base_agent import BaseAgent
 from app.core.constants import is_control_flag
+from app.core.risultati import APPLICATO, GIA_IMPOSTATO, e_comando_non_ammesso, e_guasto_tool
 from app.graph.state import GraphState
 from app.tools.sensor_tools import get_default_iot_tools
 
@@ -120,6 +121,9 @@ class ClimateAgent(BaseAgent):
         ai_response = await self.ask_brain(system_prompt, user_prompt, temperature=0.0, max_tokens=2048)
         ai_response_str = ai_response.strip().upper()
         logger.info(f"[{self.name}] Risposta AI: {ai_response_str}")
+        decisione = self.estrai_decisione(ai_response, ("ACTION", "ESCALATE", "NONE"))
+        if decisione is None and not (has_conflict and not recently_reconciled):
+            raise self.decisione_non_riconosciuta(ai_response)
 
         update: dict[str, Any] = {}
 
@@ -150,10 +154,10 @@ class ClimateAgent(BaseAgent):
             update["next_agent"] = "brain"
             update["messages"] = [AIMessage(content=f"[{self.name}] Conflitto rilevato. Escalation inviata al Cervello per {target_device}.")]
 
-        elif "DECISIONE: ACTION" in ai_response_str and not has_conflict:
+        elif decisione == "ACTION" and not has_conflict:
             reasoning = f"Attivazione consigliata da AI: {ai_response_str}"
 
-            applied = await self.apply_status(
+            risultato = await self.applica_stato(
                 target=target_device,
                 action="TURN_ON_AC",
                 new_value=AC_TARGET_VALUE,
@@ -162,14 +166,24 @@ class ClimateAgent(BaseAgent):
                 tools_map=self.tools
             )
 
-            if applied:
+            update["next_agent"] = "END"
+            if risultato["status"] == APPLICATO:
                 logger.info(f"[{self.name}] Azione eseguita: {current_status} -> {AC_TARGET_VALUE} su {target_device}")
                 update["messages"] = [AIMessage(content=f"[{self.name}] AC attivata su {target_device}: {current_status} -> {AC_TARGET_VALUE}.")]
-            else:
+            elif risultato["status"] == GIA_IMPOSTATO:
                 logger.info(f"[{self.name}] Azione saltata: {target_device} gia' impostata a {AC_TARGET_VALUE} (In stabilizzazione).")
                 update["messages"] = [AIMessage(content=f"[{self.name}] {target_device} gia' impostata a {AC_TARGET_VALUE}. In stabilizzazione.")]
-
-            update["next_agent"] = "END"
+            else:
+                # Guasto del dispositivo o priorità insufficiente: il motivo sale al Cervello nell'escalation
+                update["pending_escalations"] = [await self.escala_da_risultato(risultato, proposed_action=AC_TARGET_VALUE)]
+                update["next_agent"] = "brain"
+                if e_guasto_tool(risultato):
+                    dettaglio = f"guasto ({risultato['response']})"
+                elif e_comando_non_ammesso(risultato):
+                    dettaglio = f"comando non ammesso ({risultato['response']})"
+                else:
+                    dettaglio = "bloccata da una priorità superiore"
+                update["messages"] = [AIMessage(content=f"[{self.name}] Azione su {target_device} non eseguita: {dettaglio}. Escalation inviata al Cervello.")]
         else:
             logger.info(f"[{self.name}] Nessuna azione richiesta.")
             update["next_agent"] = "END"

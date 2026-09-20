@@ -10,8 +10,16 @@ services:
       - "${LANGBRAIN_PORT:-8000}:8000"
     environment:
       DB_PATH: /data/langbrain.db
+      API_KEY: "${API_KEY:-}"
+      API_KEY_PRIMARIO: "${API_KEY_PRIMARIO:-}"
+      API_KEY_MEDICO_DI_GUARDIA: "${API_KEY_MEDICO_DI_GUARDIA:-}"
+      API_KEY_TIROCINANTE: "${API_KEY_TIROCINANTE:-}"
       FLAG_TTL_MINUTES: "${FLAG_TTL_MINUTES:-60}"
       MAO_TIMEOUT_SECONDS: "${MAO_TIMEOUT_SECONDS:-40}"
+      MAO_MAX_TOKENS_MINIMO: "${MAO_MAX_TOKENS_MINIMO:-8192}"
+      MAO_MAX_TOKENS_LIMITE: "${MAO_MAX_TOKENS_LIMITE:-32768}"
+      # Vuoto: decide `fallback` in configurazione.toml (0 o 1 lo sostituiscono).
+      MAO_FALLBACK: "${MAO_FALLBACK:-}"
       DEFAULT_PROVIDER: "${DEFAULT_PROVIDER:-google_studio}"
       GOOGLE_BASE_URL: "${GOOGLE_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}"
       GEMINI_API_KEY: "${GEMINI_API_KEY:-nessuna}"
@@ -21,6 +29,9 @@ services:
       OPENROUTER_MODEL: "${OPENROUTER_MODEL:-openrouter/auto}"
       OPENROUTER_REFERER: "${OPENROUTER_REFERER:-https://github.com/youssouf994/LangBrain}"
       OPENROUTER_APP_TITLE: "${OPENROUTER_APP_TITLE:-LangBrain}"
+      MISTRAL_API_KEY: "${MISTRAL_API_KEY:-nessuna}"
+      MISTRAL_BASE_URL: "${MISTRAL_BASE_URL:-https://api.mistral.ai/v1}"
+      MISTRAL_MODEL: "${MISTRAL_MODEL:-ministral-8b-latest}"
       # Dentro Docker, 127.0.0.1 indica il container: per raggiungere il modello
       # avviato su Windows serve host.docker.internal.
       LOCAL_MODEL_BASE_URL: "${LOCAL_MODEL_DOCKER_BASE_URL:-http://host.docker.internal:8080/v1}"

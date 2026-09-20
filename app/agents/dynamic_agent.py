@@ -10,8 +10,10 @@ from langchain_core.messages import AIMessage
 
 from app.agents.base_agent import BaseAgent
 from app.core.constants import is_control_flag
+from app.core.configurazione import get_configurazione
+from app.core.risultati import APPLICATO, GIA_IMPOSTATO, e_comando_non_ammesso, e_guasto_tool
 from app.graph.state import GraphState
-from app.tools.sensor_tools import get_default_iot_tools
+from app.tools.sensor_tools import get_default_iot_tools, trova_tool
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +47,18 @@ class DynamicAgent(BaseAgent):
         self.parent_agent_name = parent_agent_name
         self.sub_agent_names = sub_agent_names or []
         self.level = level
-        self.tool_value_catalog = "\n".join(
-            f"- {target}: ['ON', 'OFF']" if any(token in str(target).lower() for token in ("breaker", "light", "lamp")) else
-            (f"- {target}: ['OPEN', 'CLOSED', '100%']" if any(token in str(target).lower() for token in ("valve", "air")) else f"- {target}: ['OFF', 'ON']")
-            for target in (managed_targets or [])
-        ) or "- Nessun target gestito."
+        self.tool_value_catalog = "\n".join(self._voce_catalogo(target) for target in (managed_targets or [])) or "- Nessun target gestito."
+        if system_prompt_template and "DECISIONE:" not in system_prompt_template:
+            # Il formato della risposta è un contratto del codice (lo legge `estrai_decisione`), non una scelta dell'utente:
+            # un prompt personalizzato che non lo descrive viene completato, altrimenti il modello non saprebbe come rispondere.
+            system_prompt_template = (
+                f"{system_prompt_template.rstrip()}\n\n"
+                f"Gestisci i target {managed_targets}. Valori validi per i device sotto il tuo dominio:\n{self.tool_value_catalog}\n"
+                "Devi decidere se eseguire un'azione (ACTION), fare escalation al Padre (ESCALATE), o fare nulla (NONE).\n"
+                "Rispondi ESATTAMENTE nel formato:\n"
+                "DECISIONE: [ACTION|ESCALATE|NONE]\n"
+                "MOTIVAZIONE: [spiegazione]"
+            )
         self.system_prompt_template = system_prompt_template or (
             f"Sei l'agente gerarchico '{name}' (Livello {level}). "
             f"Gestisci i target {managed_targets}. "
@@ -71,6 +80,19 @@ class DynamicAgent(BaseAgent):
             "Qual è la decisione corretta?"
         )
         self.tools = tools or get_default_iot_tools()
+
+    @staticmethod
+    def _voce_catalogo(target: str) -> str:
+        """Valori validi del target: da configurazione.toml se elencato, altrimenti in base al nome."""
+        descrizione = get_configurazione().descrizione_valori(target)
+        if descrizione:
+            return f"- {target}: {descrizione}"
+        nome = str(target).lower()
+        if any(token in nome for token in ("breaker", "light", "lamp")):
+            return f"- {target}: ['ON', 'OFF']"
+        if any(token in nome for token in ("valve", "air")):
+            return f"- {target}: ['OPEN', 'CLOSED', '100%']"
+        return f"- {target}: ['OFF', 'ON']"
 
     def _parent_route(self) -> str:
         """Restituisce il nome canonico del nodo padre noto al grafo."""
@@ -95,11 +117,30 @@ class DynamicAgent(BaseAgent):
         # Le escalation ricevute da un figlio risalgono di un livello. La coda è
         # già nello stato condiviso: non viene riaggiunta, evitando duplicazioni.
         if agent_escalations:
-            return {
+            aggiornamenti: list[dict[str, Any]] = []
+            messaggi = [f"[{self.name}] Escalation del sotto-agente inoltrata a {self.parent_agent_name}."]
+            for esc in agent_escalations:
+                # Un guasto di un dispositivo viene prima diagnosticato qui, se questo agente ha priorità sufficiente.
+                if not self.puo_fare_troubleshooting(esc):
+                    continue
+                esito = await self.risolvi_guasto_tool(esc, self.tools)
+                dispositivo = esc.get("target_device")
+                if esito["resolved"]:
+                    aggiornamenti.append({**esc, "resolved": True})
+                    messaggi = [f"[{self.name}] Guasto di '{dispositivo}' risolto con troubleshooting: {esito['diagnosis']}"]
+                else:
+                    aggiornamenti.append({**esc, "tool_result": esito["tool_result"]})
+                    messaggi.append(
+                        f"[{self.name}] Troubleshooting su '{dispositivo}' non risolutivo: {esito['diagnosis']}"
+                    )
+            update: dict[str, Any] = {
                 "next_agent": self._parent_route(),
                 "config": runtime_config,
-                "messages": [AIMessage(content=f"[{self.name}] Escalation del sotto-agente inoltrata a {self.parent_agent_name}.")],
+                "messages": [AIMessage(content="\n".join(messaggi))],
             }
+            if aggiornamenti:
+                update["pending_escalations"] = aggiornamenti
+            return update
 
         # Visita i sotto-agenti configurati una volta per ciclo, anche quando
         # l'organo possiede target diretti. Al ritorno, l'organo prosegue la sua analisi.
@@ -116,7 +157,7 @@ class DynamicAgent(BaseAgent):
             return {"next_agent": self._parent_route(), "config": runtime_config}
 
         primary_target = self.managed_targets[0]
-        tool_obj = self.tools.get(primary_target)
+        tool_obj = trova_tool(primary_target, self.tools)
 
         # 1. Readout stato reale dal tool
         current_status = "OFF"
@@ -167,18 +208,22 @@ class DynamicAgent(BaseAgent):
         ai_response = await self.ask_brain(self.system_prompt_template, user_prompt, temperature=0.0, max_tokens=2048)
         ai_response_str = ai_response.strip().upper()
         logger.info(f"[{self.name}] Risposta AI: {ai_response_str}")
+        decisione = self.estrai_decisione(ai_response, ("ACTION", "ESCALATE", "NONE"))
+        if decisione is None and not (has_conflict and not recently_reconciled):
+            raise self.decisione_non_riconosciuta(ai_response)
 
         update: dict[str, Any] = {}
         update["config"] = runtime_config
 
         # 5. Gestione decisione ed Escalation verso il Padre
-        if (has_conflict and not recently_reconciled) or ("DECISIONE: ESCALATE" in ai_response_str):
+        if (has_conflict and not recently_reconciled) or decisione == "ESCALATE":
             reason = f"Conflitto/anomalia rilevata da {self.name}: {ai_response}"
             logger.warning(f"[{self.name}] Escalation inviata a '{self.parent_agent_name}' per {primary_target}")
 
+            proposta = get_configurazione().valore_attivo(primary_target)
             escalation = self.create_escalation(
                 target_device=primary_target,
-                proposed_action="TURN_ON",
+                proposed_action=proposta,
                 reason=reason,
                 conflict_detected=True,
                 context_events=[conflict_event] if conflict_event else [],
@@ -189,7 +234,7 @@ class DynamicAgent(BaseAgent):
                 action="ESCALATION_PROPOSED",
                 target=primary_target,
                 old_value=current_status,
-                new_value="TURN_ON",
+                new_value=proposta,
                 reasoning=reason,
                 escalated=True,
             )
@@ -198,32 +243,33 @@ class DynamicAgent(BaseAgent):
             update["next_agent"] = self._parent_route()
             update["messages"] = [AIMessage(content=f"[{self.name}] Conflitto rilevato. Escalation inviata a {self.parent_agent_name} per {primary_target}.")]
 
-        elif "DECISIONE: ACTION" in ai_response_str and not has_conflict:
+        elif decisione == "ACTION" and not has_conflict:
             reasoning = f"Azione consigliata da AI in {self.name}: {ai_response_str}"
-            applied = await self.apply_status(
+            valore_attivo = get_configurazione().valore_attivo(primary_target)
+            risultato = await self.applica_stato(
                 target=primary_target,
                 action="DYNAMIC_ACTION",
-                new_value="ON",
+                new_value=valore_attivo,
                 reasoning=reasoning,
                 escalated=False,
                 tools_map=self.tools,
             )
-            if applied:
+            update["next_agent"] = self._parent_route()
+            if risultato["status"] == APPLICATO:
                 update["messages"] = [AIMessage(content=f"[{self.name}] Azione eseguita su {primary_target} (applied=True).")]
-                update["next_agent"] = self._parent_route()
+            elif risultato["status"] == GIA_IMPOSTATO:
+                update["messages"] = [AIMessage(content=f"[{self.name}] {primary_target} già impostato: nessuna azione necessaria.")]
             else:
-                # Azione bloccata per priorità: genera escalation verso il Padre
-                reason = f"Azione su {primary_target} bloccata da vincolo di priorità per {self.name}"
-                escalation = self.create_escalation(
-                    target_device=primary_target,
-                    proposed_action="TURN_ON",
-                    reason=reason,
-                    conflict_detected=True,
-                    context_events=[],
-                )
+                # Priorità insufficiente o guasto del dispositivo: il motivo sale al Padre nell'escalation
+                escalation = await self.escala_da_risultato(risultato, proposed_action=valore_attivo)
                 update["pending_escalations"] = [escalation]
-                update["next_agent"] = self._parent_route()
-                update["messages"] = [AIMessage(content=f"[{self.name}] Azione su {primary_target} bloccata per priorità. Escalation inviata a {self.parent_agent_name}.")]
+                if e_guasto_tool(risultato):
+                    testo = f"[{self.name}] Guasto di {primary_target}: {risultato['response']}. Escalation inviata a {self.parent_agent_name}."
+                elif e_comando_non_ammesso(risultato):
+                    testo = f"[{self.name}] Comando non ammesso su {primary_target}: {risultato['response']} Escalation inviata a {self.parent_agent_name}."
+                else:
+                    testo = f"[{self.name}] Azione su {primary_target} bloccata per priorità. Escalation inviata a {self.parent_agent_name}."
+                update["messages"] = [AIMessage(content=testo)]
         else:
             logger.info(f"[{self.name}] Nessuna azione richiesta.")
             update["next_agent"] = self._parent_route()

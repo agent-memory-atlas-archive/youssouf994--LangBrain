@@ -1,6 +1,7 @@
 import operator
 from typing import Annotated, TypedDict, Any
 from datetime import datetime, timezone
+from uuid import uuid4
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
@@ -25,23 +26,39 @@ class ActionEvent(BaseModel):
     escalated: bool = False
 
 class EscalationItem(BaseModel):
+    id: str = Field(default_factory=lambda: uuid4().hex)
+    """Identificatore stabile: permette di aggiornare o rimuovere una singola escalation nello stato."""
     source_agent: str
     target_device: str
     proposed_action: str
     reason: str
     conflict_detected: bool = False
     context_events: list[dict] = []
+    tool_result: dict | None = None
+    """Se l'escalation nasce da un guasto di un dispositivo: esito strutturato (vedi app.core.risultati)."""
 
 # --- Reducer Functions per LangGraph ---
 
 def reduce_escalations(current: list[dict] | None, update: list[dict] | None) -> list[dict]:
     """
     Se update è una lista vuota [], svuota la coda delle escalation pendenti.
-    Altrimenti accumula le nuove escalation.
+    Altrimenti accumula le nuove escalation. Un elemento con un `id` già presente sostituisce quello esistente
+    (es. per aggiungere la diagnosi di un guasto); se ha `resolved: True` lo rimuove dalla coda.
     """
     if update == []:
         return []
-    return (current or []) + (update or [])
+    unite = list(current or [])
+    for item in update or []:
+        identificativo = item.get("id")
+        posizione = next((i for i, e in enumerate(unite) if identificativo and e.get("id") == identificativo), None)
+        if posizione is None:
+            if not item.get("resolved"):
+                unite.append(item)
+        elif item.get("resolved"):
+            unite.pop(posizione)
+        else:
+            unite[posizione] = item
+    return unite
 
 def reduce_readings(current: list[dict] | None, update: list[dict] | None) -> list[dict]:
     """

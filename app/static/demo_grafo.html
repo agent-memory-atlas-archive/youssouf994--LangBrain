@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>LangBrain - grafo in azione</title>
+<style>
+  :root {
+    --sfondo: #f5f6f8; --pannello: #ffffff; --bordo: #d9dce3; --testo: #1c2333; --tenue: #667085;
+    --accento: #2563eb; --ok: #16a34a; --attenzione: #d97706; --errore: #dc2626; --nodo: #eef1f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --sfondo: #0f131c; --pannello: #171c28; --bordo: #2a3142; --testo: #e6e9f0; --tenue: #93a0b8;
+      --accento: #5b8cff; --ok: #34d17a; --attenzione: #f0a441; --errore: #f26b6b; --nodo: #202739;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--sfondo); color: var(--testo); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; padding: 14px 20px; border-bottom: 1px solid var(--bordo); background: var(--pannello); }
+  h1 { font-size: 18px; margin: 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--tenue); margin: 0 0 10px; }
+  main { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 16px; padding: 16px 20px 28px; max-width: 1400px; margin: 0 auto; }
+  @media (max-width: 960px) { main { grid-template-columns: 1fr; padding: 12px 16px 24px; } }
+  section { background: var(--pannello); border: 1px solid var(--bordo); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+  .colonna { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .riga { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button, select, input, textarea { font: inherit; color: var(--testo); background: var(--sfondo); border: 1px solid var(--bordo); border-radius: 6px; padding: 7px 12px; }
+  button { cursor: pointer; }
+  button.primario { background: var(--accento); border-color: var(--accento); color: #fff; }
+  button.ok { background: var(--ok); border-color: var(--ok); color: #fff; }
+  button.pericolo { background: var(--errore); border-color: var(--errore); color: #fff; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--accento); outline-offset: 2px; }
+  .stato { display: inline-flex; align-items: center; gap: 6px; color: var(--tenue); }
+  .pallino { width: 9px; height: 9px; border-radius: 50%; background: var(--tenue); }
+  .pallino.ok { background: var(--ok); } .pallino.errore { background: var(--errore); }
+  #avviso { display: none; margin: 12px 20px 0; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--errore); color: var(--errore); background: var(--pannello); }
+  svg { width: 100%; height: auto; display: block; }
+  .arco { stroke: var(--bordo); stroke-width: 2; fill: none; }
+  .arco.percorso { stroke: var(--accento); stroke-width: 3; }
+  .nodo rect { fill: var(--nodo); stroke: var(--bordo); stroke-width: 2; }
+  .nodo text { fill: var(--testo); font-size: 12px; text-anchor: middle; pointer-events: none; }
+  .nodo .peso { fill: var(--tenue); font-size: 10px; }
+  .nodo.visitato rect { stroke: var(--ok); }
+  .nodo.attivo rect { stroke: var(--accento); stroke-width: 3; animation: pulsa 1.1s ease-in-out infinite; }
+  .nodo.pausa rect { stroke: var(--attenzione); stroke-width: 3; }
+  .nodo.errore rect { stroke: var(--errore); stroke-width: 3; }
+  @keyframes pulsa { 50% { fill: color-mix(in srgb, var(--accento) 22%, var(--nodo)); } }
+  @media (prefers-reduced-motion: reduce) { .nodo.attivo rect { animation: none; } }
+  .legenda { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 8px; color: var(--tenue); font-size: 12px; }
+  .legenda span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; border: 2px solid var(--bordo); vertical-align: -1px; }
+  .legenda .l-attivo::before { border-color: var(--accento); } .legenda .l-visitato::before { border-color: var(--ok); }
+  .legenda .l-pausa::before { border-color: var(--attenzione); } .legenda .l-errore::before { border-color: var(--errore); }
+  ol#passi { list-style: none; margin: 0; padding: 0; max-height: 300px; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
+  ol#passi li { border-left: 3px solid var(--accento); padding: 2px 0 2px 10px; }
+  ol#passi li.avviso { border-color: var(--attenzione); } ol#passi li.errore { border-color: var(--errore); } ol#passi li.fine { border-color: var(--ok); }
+  ol#passi .titolo { font-weight: 600; } ol#passi .testo { color: var(--tenue); white-space: pre-wrap; overflow-wrap: anywhere; }
+  #hitl { display: none; border: 2px solid var(--attenzione); }
+  #hitl .prompt { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 10px; }
+  #hitl textarea { width: 100%; min-height: 54px; margin-top: 8px; }
+  .timer { font-variant-numeric: tabular-nums; color: var(--attenzione); font-weight: 600; }
+  .dispositivi { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+  .dispositivo { border: 1px solid var(--bordo); border-radius: 8px; padding: 8px 10px; background: var(--nodo); min-width: 0; }
+  .dispositivo b { display: block; font-size: 12px; color: var(--tenue); font-weight: 500; overflow-wrap: anywhere; }
+  .dispositivo.cambiato { animation: lampo 1.6s ease-out; }
+  @keyframes lampo { from { background: color-mix(in srgb, var(--accento) 35%, var(--nodo)); } }
+  .tabella { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--bordo); white-space: nowrap; max-width: 210px; overflow: hidden; text-overflow: ellipsis; }
+  td.motivo { max-width: 240px; color: var(--tenue); }
+  th { color: var(--tenue); font-weight: 500; }
+  .tenue { color: var(--tenue); }
+</style>
+</head>
+<body>
+<header>
+  <h1>LangBrain &middot; grafo in azione</h1>
+  <span class="stato"><span class="pallino" id="pallino-server"></span><span id="testo-server">connessione&hellip;</span></span>
+  <label class="riga" for="chiave">Chiave API
+    <input id="chiave" type="password" autocomplete="off" placeholder="X-API-Key" size="16">
+  </label>
+  <button id="salva-chiave" type="button">Usa</button>
+</header>
+<div id="avviso" role="alert"></div>
+
+<main>
+  <div class="colonna">
+    <section aria-labelledby="t-gerarchia">
+      <h2 id="t-gerarchia">Gerarchia degli agenti</h2>
+      <svg id="albero" viewBox="0 0 700 300" role="img" aria-label="Albero gerarchico degli agenti"></svg>
+      <div class="legenda">
+        <span>in attesa</span><span class="l-attivo">in esecuzione</span><span class="l-visitato">già eseguito</span>
+        <span class="l-pausa">in pausa per l'operatore</span><span class="l-errore">errore</span>
+      </div>
+    </section>
+
+    <section aria-labelledby="t-dispositivi">
+      <h2 id="t-dispositivi">Dispositivi</h2>
+      <div class="dispositivi" id="dispositivi"></div>
+    </section>
+
+    <section aria-labelledby="t-eventi">
+      <h2 id="t-eventi">Registro eventi (ultime 4 ore)</h2>
+      <div class="tabella">
+        <table>
+          <thead><tr><th>Ora</th><th>Attore</th><th>Azione</th><th>Target</th><th>Valore</th><th>Motivo</th></tr></thead>
+          <tbody id="eventi"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <div class="colonna">
+    <section aria-labelledby="t-comandi">
+      <h2 id="t-comandi">Comandi</h2>
+      <div class="riga">
+        <label>Parti da
+          <select id="partenza"><option value="brain">brain (intero ciclo)</option></select>
+        </label>
+        <button id="esegui" class="primario" type="button">Esegui un ciclo</button>
+      </div>
+      <div class="riga" style="margin-top: 10px">
+        <button id="conflitto" type="button" title="Blocco manuale recente sulla porta: il componente serratura dovrà fare escalation">Simula blocco manuale sulla porta</button>
+        <button id="sblocca" type="button" title="Riporta la porta a OFF e chiude il blocco">Sblocca la porta</button>
+      </div>
+      <p class="tenue" style="margin: 10px 0 0">Il ciclo usa i modelli reali configurati nel <code>.env</code>: ogni nodo è una chiamata al modello, quindi può richiedere qualche secondo.</p>
+    </section>
+
+    <section id="hitl" aria-labelledby="t-hitl" aria-live="polite">
+      <h2 id="t-hitl">Il grafo attende l'operatore</h2>
+      <p class="prompt" id="hitl-testo"></p>
+      <div class="riga"><span>Tempo rimasto:</span><span class="timer" id="hitl-timer">nessun timer</span></div>
+      <div class="riga" style="margin-top: 10px">
+        <button id="approva" class="ok" type="button">Approva</button>
+        <button id="respingi" class="pericolo" type="button">Respingi</button>
+        <button id="override" type="button" title="Richiede la chiave del primario">Override</button>
+      </div>
+      <textarea id="direttiva" placeholder="Solo per Override: scrivi in italiano cosa deve fare il sistema (es. Sblocca la porta e impostala a LOCKED)"></textarea>
+    </section>
+
+    <section aria-labelledby="t-passi">
+      <h2 id="t-passi">Passi del grafo</h2>
+      <ol id="passi" aria-live="polite"><li class="tenue">Nessun ciclo eseguito.</li></ol>
+    </section>
+  </div>
+</main>
+
+<script>
+"use strict";
+const THREAD = "demo";
+const $ = (id) => document.getElementById(id);
+const NS = "http://www.w3.org/2000/svg";
+
+let chiave = "";
+try {
+  const dallHash = new URLSearchParams(location.hash.slice(1)).get("k");
+  if (dallHash) { sessionStorage.setItem("langbrain_chiave", dallHash); history.replaceState(null, "", location.pathname); }
+  chiave = sessionStorage.getItem("langbrain_chiave") || "";
+} catch (e) { /* storage non disponibile: la chiave resta nel campo */ }
+$("chiave").value = chiave;
+
+const stato = { nodi: {}, valori: {}, inEsecuzione: false, timer: null, scadenza: null };
+
+function avviso(testo) {
+  const el = $("avviso");
+  el.textContent = testo || "";
+  el.style.display = testo ? "block" : "none";
+}
+
+async function api(percorso, opzioni = {}) {
+  const intestazioni = { "Content-Type": "application/json" };
+  if (chiave) intestazioni["X-API-Key"] = chiave;
+  const risposta = await fetch(percorso, { ...opzioni, headers: intestazioni });
+  if (risposta.status === 401) throw new Error("Chiave API mancante o non valida: inseriscila in alto e premi Usa.");
+  if (risposta.status === 403) throw new Error((await risposta.json()).detail || "Ruolo insufficiente per questa azione.");
+  if (!risposta.ok) {
+    let dettaglio = risposta.statusText;
+    try { const j = await risposta.json(); dettaglio = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail || j); } catch (e) { /* corpo non JSON */ }
+    throw new Error(`${risposta.status}: ${dettaglio}`);
+  }
+  return risposta;
+}
+
+/* ---------------------------------------------------------------- albero */
+
+function el(nome, attributi = {}, testo) {
+  const nodo = document.createElementNS(NS, nome);
+  for (const [k, v] of Object.entries(attributi)) nodo.setAttribute(k, v);
+  if (testo !== undefined) nodo.textContent = testo;
+  return nodo;
+}
+
+function disegnaAlbero(albero, agenti) {
+  const svg = $("albero");
+  svg.replaceChildren();
+  stato.nodi = {};
+  const pesi = Object.fromEntries(agenti.map((a) => [a.name.toLowerCase(), a.priority_weight]));
+
+  let prossimaFoglia = 0;
+  let profondita = 0;
+  const posiziona = (n, livello) => {
+    profondita = Math.max(profondita, livello);
+    n.livello = livello;
+    if (!n.children.length) n.x = prossimaFoglia++;
+    else { n.children.forEach((c) => posiziona(c, livello + 1)); n.x = (n.children[0].x + n.children[n.children.length - 1].x) / 2; }
+  };
+  posiziona(albero, 0);
+
+  const larghezzaNodo = 128, altezzaNodo = 44, passoX = 146, passoY = 96;
+  const larghezza = Math.max(prossimaFoglia * passoX, 320);
+  const altezza = (profondita + 1) * passoY;
+  svg.setAttribute("viewBox", `0 0 ${larghezza} ${altezza}`);
+  const centro = (n) => [n.x * passoX + passoX / 2 + (larghezza - prossimaFoglia * passoX) / 2, n.livello * passoY + altezzaNodo / 2 + 6];
+
+  const archi = el("g"), nodi = el("g");
+  const visita = (n, padre) => {
+    const [cx, cy] = centro(n);
+    if (padre) {
+      const [px, py] = centro(padre);
+      const arco = el("path", { class: "arco", d: `M${px},${py + altezzaNodo / 2} C${px},${(py + cy) / 2} ${cx},${(py + cy) / 2} ${cx},${cy - altezzaNodo / 2}` });
+      arco.dataset.a = n.name.toLowerCase();
+      archi.appendChild(arco);
+    }
+    const g = el("g", { class: "nodo", transform: `translate(${cx - larghezzaNodo / 2},${cy - altezzaNodo / 2})` });
+    g.appendChild(el("title", {}, n.name));
+    g.appendChild(el("rect", { width: larghezzaNodo, height: altezzaNodo, rx: 9 }));
+    const nome = n.name.length > 20 ? n.name.slice(0, 19) + "…" : n.name;
+    g.appendChild(el("text", { x: larghezzaNodo / 2, y: 19 }, nome));
+    const peso = pesi[n.name.toLowerCase()];
+    g.appendChild(el("text", { x: larghezzaNodo / 2, y: 34, class: "peso" }, n.livello === 0 ? "orchestratore" : `priorità ${peso ?? "?"}`));
+    nodi.appendChild(g);
+    stato.nodi[n.name.toLowerCase()] = g;
+    n.children.forEach((c) => visita(c, n));
+  };
+  visita(albero, null);
+  svg.append(archi, nodi);
+  stato.archi = archi;
+}
+
+function marca(nodo, classe) {
+  const g = stato.nodi[(nodo || "").toLowerCase()];
+  if (!g) return;
+  g.classList.remove("attivo", "pausa", "errore");
+  if (classe === "visitato") g.classList.add("visitato");
+  else if (classe) g.classList.add(classe);
+}
+
+function azzeraPercorso() {
+  Object.values(stato.nodi).forEach((g) => g.classList.remove("visitato", "attivo", "pausa", "errore"));
+  stato.archi?.querySelectorAll(".percorso").forEach((a) => a.classList.remove("percorso"));
+}
+
+function evidenziaArco(nodo) {
+  stato.archi?.querySelectorAll("path").forEach((a) => { if (a.dataset.a === (nodo || "").toLowerCase()) a.classList.add("percorso"); });
+}
+
+/* ---------------------------------------------------------------- dati */
+
+async function caricaStruttura() {
+  const [gerarchia, agenti] = await Promise.all([
+    api("/agents/hierarchy").then((r) => r.json()),
+    api("/agents").then((r) => r.json()),
+  ]);
+  disegnaAlbero(gerarchia.tree, agenti.agents);
+  const scelta = $("partenza");
+  const corrente = scelta.value;
+  scelta.replaceChildren(new Option("brain (intero ciclo)", "brain"));
+  agenti.agents.forEach((a) => scelta.appendChild(new Option(a.name, a.name)));
+  if ([...scelta.options].some((o) => o.value === corrente)) scelta.value = corrente;
+}
+
+async function caricaDispositivi() {
+  const dati = await api("/tools").then((r) => r.json());
+  const contenitore = $("dispositivi");
+  const presenti = new Map([...contenitore.children].map((d) => [d.dataset.nome, d]));
+  for (const [nome, info] of Object.entries(dati).sort()) {
+    const testo = info.error ? "guasto" : `${info.value ?? ""}`;
+    let scheda = presenti.get(nome);
+    if (!scheda) {
+      scheda = document.createElement("div");
+      scheda.className = "dispositivo";
+      scheda.dataset.nome = nome;
+      scheda.append(document.createElement("b"), document.createElement("span"));
+      scheda.firstChild.textContent = nome;
+      contenitore.appendChild(scheda);
+    } else if (stato.valori[nome] !== undefined && stato.valori[nome] !== testo) {
+      scheda.classList.remove("cambiato"); void scheda.offsetWidth; scheda.classList.add("cambiato");
+    }
+    scheda.lastChild.textContent = testo;
+    stato.valori[nome] = testo;
+  }
+}
+
+async function caricaEventi() {
+  const dati = await api("/events?window_minutes=240").then((r) => r.json());
+  const corpo = $("eventi");
+  corpo.replaceChildren();
+  dati.events.slice(0, 14).forEach((e) => {
+    const riga = document.createElement("tr");
+    const ora = (e.timestamp || "").slice(11, 19);
+    const valore = e.old_value != null || e.new_value != null ? `${e.old_value ?? ""} → ${e.new_value ?? ""}` : "";
+    [ora, e.actor, e.action, e.target, valore, e.reasoning || ""].forEach((v, i) => {
+      const cella = document.createElement("td");
+      if (i === 5) cella.className = "motivo";
+      cella.textContent = v;
+      cella.title = v;
+      riga.appendChild(cella);
+    });
+    corpo.appendChild(riga);
+  });
+  if (!dati.events.length) { const r = document.createElement("tr"), c = document.createElement("td"); c.colSpan = 6; c.className = "tenue"; c.textContent = "Nessun evento nella finestra."; r.appendChild(c); corpo.appendChild(r); }
+}
+
+async function aggiornaTutto() {
+  try { await Promise.all([caricaDispositivi(), caricaEventi()]); } catch (e) { avviso(e.message); }
+}
+
+/* ---------------------------------------------------------------- passi e HITL */
+
+function aggiungiPasso(classe, titolo, testo) {
+  const lista = $("passi");
+  if (lista.firstChild && lista.firstChild.classList.contains("tenue")) lista.replaceChildren();
+  const voce = document.createElement("li");
+  if (classe) voce.className = classe;
+  const t = document.createElement("div"); t.className = "titolo"; t.textContent = titolo;
+  voce.appendChild(t);
+  if (testo) { const d = document.createElement("div"); d.className = "testo"; d.textContent = testo.length > 500 ? testo.slice(0, 500) + "…" : testo; voce.appendChild(d); }
+  lista.appendChild(voce);
+  lista.scrollTop = lista.scrollHeight;
+}
+
+function mostraHitl(richiesta) {
+  const p = richiesta || {};
+  $("hitl").style.display = "block";
+  $("hitl-testo").textContent = p.prompt || JSON.stringify(p, null, 2);
+  $("approva").textContent = p.type === "llm_failure_human_intervention" ? "Riprova (Approva)" : "Approva";
+  $("hitl").scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+
+function nascondiHitl() {
+  $("hitl").style.display = "none";
+  clearInterval(stato.timer);
+  stato.timer = null;
+}
+
+function avviaConteggio(timer) {
+  clearInterval(stato.timer);
+  const etichetta = $("hitl-timer");
+  if (!timer || !timer.attivo || timer.secondi_rimanenti == null) { etichetta.textContent = "nessun timer: il grafo aspetta l'operatore"; return; }
+  const scadenza = Date.now() + timer.secondi_rimanenti * 1000;
+  const azioni = { sistema: "decide il sistema", respingi: "respinto in automatico", umano: "resta in attesa" };
+  const disegna = () => {
+    const resto = Math.max(0, Math.ceil((scadenza - Date.now()) / 1000));
+    etichetta.textContent = `${resto}s (poi: ${azioni[timer.azione_alla_scadenza] || timer.azione_alla_scadenza})`;
+    if (resto === 0) { clearInterval(stato.timer); etichetta.textContent += " - scaduto"; }
+  };
+  disegna();
+  stato.timer = setInterval(disegna, 500);
+}
+
+/* ---------------------------------------------------------------- streaming del grafo */
+
+function occupato(si) {
+  stato.inEsecuzione = si;
+  ["esegui", "conflitto", "sblocca", "approva", "respingi", "override"].forEach((id) => { $(id).disabled = si; });
+  $("esegui").textContent = si ? "In esecuzione…" : "Esegui un ciclo";
+}
+
+async function eseguiFlusso(percorso, corpo) {
+  occupato(true);
+  avviso("");
+  let attivo = null;
+  try {
+    const risposta = await api(percorso, { method: "POST", body: JSON.stringify(corpo) });
+    const lettore = risposta.body.getReader();
+    const decodifica = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { done, value } = await lettore.read();
+      if (done) break;
+      buffer += decodifica.decode(value, { stream: true });
+      let fine;
+      while ((fine = buffer.indexOf("\n\n")) >= 0) {
+        const blocco = buffer.slice(0, fine);
+        buffer = buffer.slice(fine + 2);
+        if (blocco.startsWith("data: ")) attivo = await gestisciEvento(JSON.parse(blocco.slice(6)), attivo);
+      }
+    }
+  } catch (e) {
+    avviso(e.message);
+    aggiungiPasso("errore", "Errore", e.message);
+  } finally {
+    occupato(false);
+    aggiornaTutto();
+  }
+}
+
+async function gestisciEvento(e, attivo) {
+  if (e.tipo === "nodo") {
+    marca(e.nodo, "visitato");
+    evidenziaArco(e.nodo);
+    const dest = e.prossimo && e.prossimo !== "END" ? e.prossimo : null;
+    if (dest) marca(dest, "attivo");
+    aggiungiPasso("", `${e.nodo}  →  ${dest || "fine ciclo"}`, e.messaggio);
+    caricaEventi().catch(() => {}); caricaDispositivi().catch(() => {});
+    return dest;
+  }
+  if (e.tipo === "pausa") {
+    marca(attivo, "pausa");
+    aggiungiPasso("avviso", "Pausa: serve l'operatore", (e.richiesta && e.richiesta.prompt) || "");
+    mostraHitl(e.richiesta);
+    return attivo;
+  }
+  if (e.tipo === "errore") {
+    marca(attivo, "errore");
+    aggiungiPasso("errore", `Errore ${e.codice || ""}`.trim(), e.messaggio || e.motivo || "");
+    return attivo;
+  }
+  if (e.tipo === "fine") {
+    if (!e.in_pausa) { if (attivo) marca(attivo, "visitato"); nascondiHitl(); aggiungiPasso("fine", "Ciclo concluso", ""); }
+    else avviaConteggio(e.hitl_timer);
+  }
+  return attivo;
+}
+
+function avviaCiclo() {
+  azzeraPercorso();
+  nascondiHitl();
+  $("passi").replaceChildren();
+  const inizio = $("partenza").value;
+  marca(inizio, "attivo");
+  eseguiFlusso("/graph/run/stream", { force_next_agent: inizio, thread_id: THREAD });
+}
+
+function decidi(decisione, motivo) {
+  nascondiHitl();
+  aggiungiPasso("", `Decisione dell'operatore: ${decisione}`, motivo);
+  eseguiFlusso("/graph/resume/stream", { decision: decisione, reasoning: motivo, thread_id: THREAD });
+}
+
+/* ---------------------------------------------------------------- comandi */
+
+$("esegui").addEventListener("click", avviaCiclo);
+$("approva").addEventListener("click", () => decidi("APPROVA", "Approvato dall'operatore dalla pagina dimostrativa."));
+$("respingi").addEventListener("click", () => decidi("RESPINGI", "Respinto dall'operatore dalla pagina dimostrativa."));
+$("override").addEventListener("click", () => {
+  const direttiva = $("direttiva").value.trim();
+  if (!direttiva) { avviso("Scrivi la direttiva per l'Override nel campo sotto i pulsanti."); return; }
+  decidi("OVERRIDE", direttiva);
+});
+$("conflitto").addEventListener("click", async () => {
+  try {
+    await api("/events/seed-conflict", { method: "POST", body: JSON.stringify({
+      actor: "user_manual", action: "SECURITY_LOCK", target: "front_door_lock", old_value: "LOCKED", new_value: "LOCKED",
+      reasoning: "Blocco manuale dalla pagina dimostrativa: porta in verifica.",
+    }) });
+    aggiungiPasso("avviso", "Blocco manuale registrato sulla porta", "Esegui un ciclo: il componente serratura dovrà fare escalation.");
+    aggiornaTutto();
+  } catch (e) { avviso(e.message); }
+});
+$("sblocca").addEventListener("click", async () => {
+  try {
+    await api("/events/unblock", { method: "POST", body: JSON.stringify({ target: "front_door_lock", reasoning: "Sblocco dalla pagina dimostrativa." }) });
+    aggiungiPasso("fine", "Porta sbloccata", "");
+    aggiornaTutto();
+  } catch (e) { avviso(e.message); }
+});
+$("salva-chiave").addEventListener("click", () => {
+  chiave = $("chiave").value.trim();
+  try { sessionStorage.setItem("langbrain_chiave", chiave); } catch (e) { /* solo per questa pagina */ }
+  avvia();
+});
+
+async function avvia() {
+  avviso("");
+  try {
+    await api("/");
+    $("pallino-server").className = "pallino ok";
+    $("testo-server").textContent = "server raggiungibile";
+    await caricaStruttura();
+    await aggiornaTutto();
+    const st = await api(`/graph/state?thread_id=${THREAD}`).then((r) => r.json());
+    if (st.is_interrupted) {
+      const richiesta = st.tasks.flatMap((t) => t.interrupts)[0];
+      aggiungiPasso("avviso", "Il grafo era già in pausa", "Trovata una richiesta in attesa sul thread della demo.");
+      mostraHitl({ prompt: String(richiesta) });
+      avviaConteggio(st.hitl_timer);
+    }
+  } catch (e) {
+    $("pallino-server").className = "pallino errore";
+    $("testo-server").textContent = "non raggiungibile";
+    avviso(e.message);
+  }
+}
+avvia();
+</script>
+</body>
+</html>

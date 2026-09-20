@@ -1,0 +1,6 @@
+# Configurazione dei test: dispositivi non elencati consentiti, ripiego LLM spento.
+[llm]
+fallback = false
+
+[politica]
+dispositivi_non_elencati = "consenti"

@@ -3,6 +3,7 @@ Tool Biometrici e Funzioni Deterministiche di Normalizzazione Fisiologica.
 """
 
 from typing import Any
+from app.core.constants import is_control_flag
 from app.tools.baseTool import BaseTool
 
 
@@ -41,6 +42,8 @@ class HeartRateRegulatorTool(BaseTool):
         return f"{self.bpm} BPM"
 
     async def set_tool_value(self, value: Any) -> bool:
+        if is_control_flag(value):
+            return True  # un valore numerico non può contenere un flag di controllo (es. REJECTED): resta nell'audit log
         clean_val = float(str(value).replace("BPM", "").strip())
         self.bpm = clean_val
         return True
@@ -60,6 +63,8 @@ class LungVentilatorTool(BaseTool):
         return f"{self.spo2}%"
 
     async def set_tool_value(self, value: Any) -> bool:
+        if is_control_flag(value):
+            return True  # un valore numerico non può contenere un flag di controllo (es. REJECTED): resta nell'audit log
         clean_val = float(str(value).replace("%", "").strip())
         self.spo2 = clean_val
         return True

@@ -1,0 +1,139 @@
+# Configurazione delle scelte dell'utente di LangBrain.
+#
+# Il file .env resta per segreti e parametri d'ambiente (chiavi API, URL, percorso del database).
+# Qui vanno le scelte strutturate: quali dispositivi esistono e quali valori accettano, e la politica di ripiego dei
+# provider LLM. Priorità: variabile d'ambiente > questo file > default nel codice.
+# Il file viene riletto a caldo quando cambia: non serve riavviare il server. Se la nuova versione è errata resta
+# attiva la precedente e l'errore compare nel log.
+#
+# Percorso alternativo: variabile d'ambiente LANGBRAIN_CONFIG.
+
+# ---------------------------------------------------------------------------
+# Modelli LLM
+# ---------------------------------------------------------------------------
+[llm]
+# false: un errore del provider o del modello scelto ferma il grafo e passa la palla all'operatore (HITL).
+# true: prova in silenzio gli altri provider (nell'ordine sotto) e i modelli di ripiego. Sostituibile con MAO_FALLBACK.
+fallback = false
+
+# Ordine dei provider provati quando il ripiego è attivo (dopo il provider scelto con DEFAULT_PROVIDER).
+ordine_provider = ["google_studio", "mistral", "openrouter", "local"]
+
+# Modelli di ripiego per provider, usati solo con fallback = true. Tenere solo modelli gratuiti o molto economici:
+# il ripiego scatta in silenzio. Con un elenco vuoto si prova solo il modello configurato nel .env.
+[llm.modelli_di_ripiego]
+openrouter = ["google/gemma-4-31b-it:free", "nvidia/nemotron-3-super-120b-a12b:free"]
+mistral = ["ministral-3b-latest"]
+google_studio = ["gemini-flash-latest"]
+
+# ---------------------------------------------------------------------------
+# Human-in-the-Loop: timer di attesa dell'operatore
+# ---------------------------------------------------------------------------
+[hitl]
+# 1: quando il grafo si ferma in attesa dell'operatore parte un timer; il tempo rimanente è esposto via API
+#    (GET /graph/state, GET /hitl/scadenze). 0: nessun timer, il grafo attende senza limite.
+timer_attivo = 0
+
+# Durata predefinita del timer, in secondi. Vale se il timer è attivo; `max_wait_seconds` di POST /hitl/config,
+# se impostato, la sostituisce a runtime.
+timer_predefinito_secondi = 300
+
+# Cosa succede alla scadenza:
+#   "umano":    il grafo resta in pausa e aspetta l'operatore; l'API segnala solo che il timer è scaduto.
+#   "sistema":  decide il sistema: la richiesta prosegue come se l'HITL non fosse configurato, cioè il Brain la
+#               valuta con il suo modello. Per le pause di emergenza non c'è nulla da decidere: un guasto non risolto
+#               viene registrato senza altre azioni e un LLM non disponibile annulla il ciclo.
+#   "respingi": la richiesta viene respinta in automatico (nessuna azione fisica viene eseguita).
+azione_alla_scadenza = "umano"
+
+# Dove si applica l'HITL. Sono due flussi separati, con regole proprie:
+#   "nodi":    i nodi del grafo si fermano prima di eseguire (o dopo aver proposto un'azione), secondo le regole di
+#              POST /hitl/config (hitl_all, hitl_nodes, hitl_targets, hitl_actions). Il Brain decide da solo le escalation.
+#   "brain":   il Brain, quando valuta un'escalation su un dispositivo protetto, chiede prima all'operatore. I nodi
+#              non si fermano mai.
+#   "entrambi": tutti e due i flussi (una stessa richiesta può essere chiesta due volte).
+# Le pause di emergenza (LLM non utilizzabile, guasto non risolto) restano attive con qualsiasi livello.
+livello = "entrambi"
+
+# Dispositivi per cui il Brain chiede sempre l'approvazione nel flusso "brain", in aggiunta a hitl_targets di
+# POST /hitl/config e a hitl_all. Lista vuota: nessun dispositivo protetto per default.
+target_critici_brain = ["alarm_system", "front_door_lock"]
+
+# ---------------------------------------------------------------------------
+# Dati dimostrativi
+# ---------------------------------------------------------------------------
+[demo]
+# 1: a ogni avvio il database riceve un evento di conflitto di prova (FORCE_SHUTDOWN su ac_living_room).
+# 0 (consigliato): nessun dato di prova viene scritto in automatico; per uno scenario di prova usare
+# examples/crea_scenario.py.
+conflitto_all_avvio = 0
+
+# 1: l'API serve la pagina dimostrativa su GET /demo, che mostra il grafo in azione (vedi examples/avvia_demo.py).
+# La pagina è statica e non contiene segreti: le chiamate all'API richiedono comunque la chiave. 0: /demo risponde 404.
+pagina_web = 1
+
+# ---------------------------------------------------------------------------
+# Dispositivi
+# ---------------------------------------------------------------------------
+[politica]
+# Cosa fare con un dispositivo che non compare nell'elenco qui sotto:
+#   "rifiuta": nessun agente, override o scrittura via API può comandarlo (consigliato).
+#   "consenti": qualsiasi valore è accettato per i dispositivi non elencati.
+dispositivi_non_elencati = "rifiuta"
+
+# Ogni sezione [dispositivi.<nome>] elenca ciò che il dispositivo accetta come comando. Il nome può essere un pattern
+# con * e ? (es. "device_l*"); vale la prima regola che corrisponde, prima il nome esatto.
+#   valori         valori testuali ammessi (senza distinguere maiuscole/minuscole)
+#   intervallo     [minimo, massimo] per i valori numerici
+#   unita          unità facoltativa dei numeri (es. "°C", "%"): "22.5°C" e "22.5" sono equivalenti
+#   valore_attivo  valore inviato quando un agente decide genericamente di "attivare" il dispositivo (default "ON")
+# I flag interni del sistema (REJECTED, RECONCILED_*, ...) non sono valori fisici e non vengono mai validati qui.
+# Una sezione senza valori né intervallo accetta qualsiasi valore per quel dispositivo.
+
+[dispositivi.ac_living_room]
+valori = ["OFF", "ON"]
+intervallo = [10.0, 35.0]
+unita = "°C"
+valore_attivo = "22.5°C"
+
+[dispositivi.heater_bedroom]
+valori = ["OFF", "ON"]
+intervallo = [10.0, 35.0]
+unita = "°C"
+valore_attivo = "22.5°C"
+
+[dispositivi.front_door_lock]
+valori = ["LOCKED", "UNLOCKED"]
+valore_attivo = "LOCKED"
+
+[dispositivi.alarm_system]
+valori = ["ARMED", "DISARMED"]
+valore_attivo = "ARMED"
+
+[dispositivi.living_room_lights]
+valori = ["ON", "OFF"]
+intervallo = [0.0, 100.0]
+unita = "%"
+valore_attivo = "ON"
+
+[dispositivi.cardiac_pacemaker]
+intervallo = [30.0, 220.0]
+unita = "BPM"
+
+[dispositivi.oxygen_regulator]
+intervallo = [0.0, 100.0]
+unita = "%"
+
+# Dispositivi usati dalle demo e dagli script di smoke test.
+[dispositivi.vault_door]
+valori = ["LOCKED", "UNLOCKED", "OPEN", "CLOSED"]
+valore_attivo = "LOCKED"
+
+[dispositivi.security_perimeter]
+valori = ["ON", "OFF"]
+
+[dispositivi.access_control]
+valori = ["ON", "OFF"]
+
+[dispositivi."device_l*"]
+valori = ["ON", "OFF"]

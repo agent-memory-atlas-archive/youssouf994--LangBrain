@@ -18,6 +18,10 @@ _CONTROL_FLAG_PREFIXES = (
     "ESCALATION_",
     "BLOCKED",
     "EXPIRED_",
+    "TOOL_ERROR",
+    "INVALID_COMMAND",
+    "TOOL_FAILURE",
+    "TROUBLESHOOT_",
 )
 
 

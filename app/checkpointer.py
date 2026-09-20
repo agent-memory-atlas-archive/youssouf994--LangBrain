@@ -1,61 +1,75 @@
-import os
-import pickle
-import logging
-from typing import Optional
+"""
+Checkpointer LangGraph persistente su SQLite.
 
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.checkpoint.base import BaseCheckpointSaver
+Usa lo stesso file del database applicativo (`DB_PATH`): le tabelle `checkpoints` e `writes`
+conservano thread, stato e interrupt HITL pendenti, che sopravvivono a riavvii e ricompilazioni del grafo.
+La connessione è dedicata al checkpointer e va aperta nel lifespan dell'applicazione e chiusa allo spegnimento
+(un thread aiosqlite non chiuso impedisce l'uscita del processo).
+
+Limite: SQLite garantisce coerenza tra i processi che condividono il file, ma tool, registro HITL e stato dei
+device restano in memoria di processo: il deployment multi-worker richiede comunque un backend condiviso.
+"""
+
+import logging
+
+import aiosqlite
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+from app.db.database import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-# File persisted next to the project root
-_PERSIST_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".checkpointer.pickle"))
+# Attesa massima (secondi) su un DB bloccato da un'altra connessione, prima di sollevare "database is locked".
+TIMEOUT_DB_SECONDI = 30.0
+
+_connessione: aiosqlite.Connection | None = None
+_saver: AsyncSqliteSaver | None = None
+_percorso_aperto: str | None = None
 
 
-class PersistentInMemorySaver(InMemorySaver):
-    """In-memory saver esteso con persistenza su disco via pickle.
-
-    Questo mantiene l'API attesa da LangGraph (`BaseCheckpointSaver`) ma
-    scrive lo stato in un file per sopravvivere a ricompilazioni.
+async def apri_checkpointer(db_path: str = DB_PATH) -> AsyncSqliteSaver:
     """
+    Apre il checkpointer sul file indicato e crea le tabelle se mancano.
+    Chiamarla di nuovo con lo stesso file restituisce l'istanza già aperta.
+    """
+    global _connessione, _saver, _percorso_aperto
+    if _saver is not None and _percorso_aperto == db_path:
+        return _saver
+    if _saver is not None:
+        await chiudi_checkpointer()
 
-    def persist(self):
-        try:
-            with open(_PERSIST_PATH, "wb") as fh:
-                pickle.dump(self, fh)
-            logger.debug("Persisted InMemorySaver to %s", _PERSIST_PATH)
-        except Exception as ex:
-            logger.warning("Failed to persist InMemorySaver: %s", ex)
+    connessione = await aiosqlite.connect(db_path, timeout=TIMEOUT_DB_SECONDI)
+    try:
+        saver = AsyncSqliteSaver(connessione)
+        await saver.setup()
+    except Exception:
+        await connessione.close()
+        raise
 
-
-def _load_persistent() -> BaseCheckpointSaver | None:
-    if os.path.exists(_PERSIST_PATH):
-        try:
-            with open(_PERSIST_PATH, "rb") as fh:
-                obj = pickle.load(fh)
-            if isinstance(obj, BaseCheckpointSaver):
-                logger.info("Loaded persistent checkpointer from %s", _PERSIST_PATH)
-                return obj
-        except Exception as ex:
-            logger.warning("Unable to load persisted checkpointer: %s", ex)
-    return None
-
-
-# Singleton instance
-_GLOBAL_PERSISTENT: Optional[BaseCheckpointSaver] = None
+    _connessione, _saver, _percorso_aperto = connessione, saver, db_path
+    logger.info("[Checkpointer] Persistenza LangGraph attiva su SQLite: %s", db_path)
+    return saver
 
 
-def get_persistent_checkpointer() -> BaseCheckpointSaver:
-    global _GLOBAL_PERSISTENT
-    if _GLOBAL_PERSISTENT is None:
-        loaded = _load_persistent()
-        if loaded is not None:
-            _GLOBAL_PERSISTENT = loaded
-        else:
-            _GLOBAL_PERSISTENT = PersistentInMemorySaver()
-            try:
-                # attempt to persist initial state
-                getattr(_GLOBAL_PERSISTENT, "persist", lambda: None)()
-            except Exception:
-                pass
-    return _GLOBAL_PERSISTENT
+async def chiudi_checkpointer() -> None:
+    """Chiude la connessione del checkpointer. Sicura da chiamare anche se non è stato aperto."""
+    global _connessione, _saver, _percorso_aperto
+    connessione = _connessione
+    _connessione = _saver = _percorso_aperto = None
+    if connessione is not None:
+        await connessione.close()
+
+
+def get_checkpointer() -> AsyncSqliteSaver | None:
+    """Restituisce il checkpointer aperto, oppure None se `apri_checkpointer()` non è stata chiamata."""
+    return _saver
+
+
+async def svuota_checkpoint() -> None:
+    """Elimina tutti i thread persistiti (usato dal reset di sistema)."""
+    if _saver is None:
+        return
+    async with _saver.lock:
+        await _saver.conn.execute("DELETE FROM writes")
+        await _saver.conn.execute("DELETE FROM checkpoints")
+        await _saver.conn.commit()
