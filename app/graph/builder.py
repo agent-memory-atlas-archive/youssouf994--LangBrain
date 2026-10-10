@@ -5,21 +5,24 @@ Supporta la gerarchia ricorsiva N-livelli e la gestione centralizzata degli Inte
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any
 from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
-from app.agents.agent_climate import ClimateAgent
+from app.agents.agenti_nativi import crea_agente_nativo
 from app.core.errori_llm import ErroreLLM
+from app.core.lingua import scegli
 from app.graph.hitl_config import e_decisione_sistema, flusso_nodi_attivo, hitl_manager
 from app.graph.orchestrator import BrainAgent
-from app.graph.state import GraphState
+from app.graph.state import GraphState, filtra_segnali, finestra_segnali_ore
 from app.graph.timer_hitl import attesa_massima_secondi
-from app.tools.sensor_tools import get_default_iot_tools
+from app.tools.effectors import default_effectors
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +65,13 @@ async def _esegui_con_operatore(node_name: str, esegui):
                 "node_name": node_name,
                 "errore": errore.come_dizionario(),
                 "timestamp": time.time(),
-                "prompt": (
+                "prompt": scegli(
                     f"Il modello non è utilizzabile nel nodo '{node_name}' ({errore.codice}): {errore.messaggio} "
                     f"{errore.suggerimento} Dopo aver risolto riprendi con APPROVA (o RETRY) per riprovare, "
-                    "oppure RESPINGI per annullare il ciclo."
+                    "oppure RESPINGI per annullare il ciclo.",
+                    f"The model cannot be used in node '{node_name}' ({errore.codice}): {errore.messaggio} "
+                    f"{errore.suggerimento} Once fixed, resume with APPROVE (or RETRY) to try again, "
+                    "or REJECT to cancel the cycle.",
                 ),
             })
             decisione = str(risposta.get("decision", "APPROVA") if isinstance(risposta, dict) else risposta or "APPROVA").upper()
@@ -89,9 +95,11 @@ def wrap_node_with_hitl(node_name: str, agent_obj: Any):
                 "node_name": node_name,
                 "timestamp": time.time(),
                 "max_wait_seconds": attesa_massima_secondi(),
-                "prompt": (
+                "prompt": scegli(
                     f"Approvazione Umana Richiesta: esecuzione nodo '{node_name}'. "
-                    f"Attesa max: {attesa_massima_secondi() or 'illimitata'}s."
+                    f"Attesa max: {attesa_massima_secondi() or 'illimitata'}s.",
+                    f"Human approval required: run node '{node_name}'. "
+                    f"Maximum wait: {attesa_massima_secondi() or 'unlimited'}s.",
                 ),
             })
 
@@ -111,8 +119,8 @@ def wrap_node_with_hitl(node_name: str, agent_obj: Any):
             elif "RESPINGI" in decision_val or "REJECT" in decision_val or "NO" in decision_val:
                 logger.info(f"[HITL Interceptor] Nodo '{node_name}' bloccato da rifiuto umano ({reasoning}).")
                 try:
-                    from app.tools.event_log import EventLog
-                    log = EventLog()
+                    from app.tools.nervous_system import NervousSystem
+                    log = NervousSystem()
                     events = await log.get_recent_events()
                     for e in events:
                         act = str(e.get("action", ""))
@@ -156,8 +164,8 @@ def wrap_node_with_hitl(node_name: str, agent_obj: Any):
                 fallback_target = "unknown"
                 fallback_action = "UNBLOCK_AND_SET"
                 try:
-                    from app.tools.event_log import EventLog
-                    log = EventLog()
+                    from app.tools.nervous_system import NervousSystem
+                    log = NervousSystem()
                     events = await log.get_recent_events()
                     # Individua il primo target non ancora riconciliato
                     for e in events:
@@ -206,8 +214,8 @@ def wrap_node_with_hitl(node_name: str, agent_obj: Any):
                 # Approvazione normale (APPROVA / YES)
                 if node_name == "brain":
                     try:
-                        from app.tools.event_log import EventLog
-                        log = EventLog()
+                        from app.tools.nervous_system import NervousSystem
+                        log = NervousSystem()
                         events = await log.get_recent_events()
                         for e in events:
                             act = str(e.get("action", ""))
@@ -240,7 +248,7 @@ def wrap_node_with_hitl(node_name: str, agent_obj: Any):
                 return await agent_obj(state)
             if callable(getattr(agent_obj, "process", None)):
                 recent_events = state.get("recent_events", [])
-                relevant_readings = state.get("readings", [])
+                relevant_readings = filtra_segnali(state.get("readings", []), finestra_segnali_ore(state.get("config")))
                 agent_escalations = state.get("pending_escalations", [])
                 return await agent_obj.process(state, recent_events, relevant_readings, agent_escalations)
             return {}
@@ -271,9 +279,11 @@ def wrap_node_with_hitl(node_name: str, agent_obj: Any):
                     "proposed_action": a,
                     "timestamp": time.time(),
                     "max_wait_seconds": attesa_massima_secondi(),
-                    "prompt": (
+                    "prompt": scegli(
                         f"Approvazione Umana Richiesta per target '{t}' (Azione: {a}). "
-                        f"Attesa max: {attesa_massima_secondi() or 'illimitata'}s."
+                        f"Attesa max: {attesa_massima_secondi() or 'illimitata'}s.",
+                        f"Human approval required for target '{t}' (action: {a}). "
+                        f"Maximum wait: {attesa_massima_secondi() or 'unlimited'}s.",
                     ),
                 })
 
@@ -293,6 +303,43 @@ def wrap_node_with_hitl(node_name: str, agent_obj: Any):
     return hitl_wrapped_agent_node
 
 
+def traccia_nodo(node_name: str, nodo):
+    """
+    Avvolge il nodo registrando ogni esecuzione (nodo, durata, esito: ok, escalated, waiting se il grafo si ferma per un
+    umano, error) nella tabella `node_runs`, da cui `GET /graph/stats` ricava i grafici. La traccia non cambia il
+    risultato del nodo e un suo errore non ferma il grafo. La run è `state["config"]["run_id"]` (assegnato da
+    `/graph/run`), altrimenti il thread.
+    """
+    async def nodo_tracciato(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
+        inizio = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        clock = time.perf_counter()
+        esito, dettaglio = "ok", ""
+        try:
+            risultato = await nodo(state)
+            if any(not e.get("resolved") for e in (risultato or {}).get("pending_escalations", []) or []):
+                esito = "escalated"
+            dettaglio = str((risultato or {}).get("next_agent") or "")
+            return risultato
+        except GraphBubbleUp:
+            esito = "waiting"
+            raise
+        except BaseException as errore:
+            esito, dettaglio = "error", type(errore).__name__
+            raise
+        finally:
+            try:
+                from app.tools.nervous_system import NervousSystem
+
+                thread_id = str(((config or {}).get("configurable") or {}).get("thread_id") or "")
+                run_id = str((state.get("config") or {}).get("run_id") or thread_id or "no-run")
+                await NervousSystem().record_node_run(run_id, node_name, inizio, (time.perf_counter() - clock) * 1000, esito,
+                                                      dettaglio, thread_id)
+            except Exception as ex:  # la traccia non deve mai cambiare l'esito del grafo
+                logger.warning(f"Traccia del nodo '{node_name}' non registrata: {ex}")
+
+    return nodo_tracciato
+
+
 def build_graph(
     custom_agent_instances: dict[str, Any] | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
@@ -304,11 +351,13 @@ def build_graph(
     `checkpointer` salva stato e interrupt (in esecuzione reale è quello SQLite di `app.checkpointer`).
     Se omesso si usa un `MemorySaver` volatile, adatto solo a test e demo.
     """
-    shared_tools = get_default_iot_tools()
+    shared_tools = default_effectors()
 
     if custom_agent_instances is None:
-        climate_agent = ClimateAgent(tools=shared_tools)
-        agent_instances: dict[str, Any] = {"agent_climate": climate_agent}
+        agent_instances: dict[str, Any] = {}
+        climate_agent = crea_agente_nativo("agent_climate", shared_tools)
+        if climate_agent is not None:
+            agent_instances["agent_climate"] = climate_agent
     else:
         agent_instances = custom_agent_instances
 
@@ -326,12 +375,12 @@ def build_graph(
     workflow = StateGraph(GraphState)
 
     # 1. Registra l'Orchestratore Padre (Brain) avvolto con HITL Interceptor
-    workflow.add_node("brain", wrap_node_with_hitl("brain", brain_agent))
+    workflow.add_node("brain", traccia_nodo("brain", wrap_node_with_hitl("brain", brain_agent)))
     registered_nodes = {"brain"}
 
     # 2. Registra tutti i sotto-agenti avvolti con HITL Interceptor
     for node_name, agent_obj in agent_instances.items():
-        workflow.add_node(node_name, wrap_node_with_hitl(node_name, agent_obj))
+        workflow.add_node(node_name, traccia_nodo(node_name, wrap_node_with_hitl(node_name, agent_obj)))
         registered_nodes.add(node_name)
 
     # 3. Flusso iniziale: START -> Brain

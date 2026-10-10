@@ -21,6 +21,18 @@ ISTRUZIONE_ERRORE_STANDARD = (
     f"{PREFISSO_RISPOSTA_STANDARD}: <motivo breve> SOLO se non riesci a produrre alcuna risposta nel formato "
     "richiesto (ad esempio la richiesta è troncata o incomprensibile). Non inventare decisioni o valori non previsti."
 )
+STANDARD_ERROR_INSTRUCTION = (
+    "Always answer in the requested format, even when the data are scarce or partial: in that case choose the most "
+    "cautious of the allowed options. Use the line "
+    f"{PREFISSO_RISPOSTA_STANDARD}: <short reason> ONLY if you cannot produce any answer in the requested format "
+    "(for example the request is truncated or incomprehensible). Do not invent decisions or values that are not allowed."
+)
+
+
+def istruzione_errore_standard() -> str:
+    """L'istruzione nella lingua in vigore (il prefisso LLM_ERRORE è lo stesso in entrambe)."""
+    from app.core.lingua import lingua
+    return STANDARD_ERROR_INSTRUCTION if lingua() == "en" else ISTRUZIONE_ERRORE_STANDARD
 
 # Codice -> cosa può fare l'operatore
 SUGGERIMENTI = {
@@ -37,6 +49,22 @@ SUGGERIMENTI = {
     "ERRORE_PROVIDER": "Errore interno del provider: riprova più tardi o cambia provider.",
     "PROVIDER_NON_SUPPORTATO": "Provider non riconosciuto: correggi DEFAULT_PROVIDER nel file .env.",
     "ERRORE_IMPREVISTO": "Errore imprevisto nella chiamata al modello: controlla i log del server.",
+}
+
+SUGGERIMENTI_EN = {
+    "CREDITI_ESAURITI": "The provider reports insufficient credits: top up the plan or switch to a free model or another provider.",
+    "CHIAVE_NON_VALIDA": "The provider refused the API key: check or replace the key in the .env file.",
+    "CHIAVE_NON_CONFIGURATA": "No usable API key for the chosen provider: set it in the .env file.",
+    "LIMITE_RICHIESTE": "The provider reached its request limit: wait a few minutes, use your own key or change model.",
+    "MODELLO_NON_TROVATO": "The model does not exist or is not available: fix the model name in the .env file.",
+    "CONTESTO_SUPERATO": "The request exceeds the model's context: choose a model with a larger context.",
+    "RISPOSTA_TRONCATA": "The answer was cut by the token limit: raise MAO_MAX_TOKENS_LIMITE or choose a larger model.",
+    "RISPOSTA_VUOTA": "The model produced no text (tokens often went into reasoning): raise MAO_MAX_TOKENS_MINIMO.",
+    "RISPOSTA_NON_UTILIZZABILE": "The model declared it cannot answer: check the context given or change model.",
+    "PROVIDER_NON_RAGGIUNGIBILE": "The provider does not answer: check the network, the configured URL and the service status.",
+    "ERRORE_PROVIDER": "Internal error of the provider: try again later or change provider.",
+    "PROVIDER_NON_SUPPORTATO": "Provider not recognised: fix DEFAULT_PROVIDER in the .env file.",
+    "ERRORE_IMPREVISTO": "Unexpected error calling the model: check the server logs.",
 }
 
 # Chiavi API e token non devono finire in payload di interrupt, checkpoint o risposte HTTP.
@@ -70,7 +98,9 @@ class ErroreLLM(RuntimeError):
 
     @property
     def suggerimento(self) -> str:
-        return SUGGERIMENTI.get(self.codice, SUGGERIMENTI["ERRORE_IMPREVISTO"])
+        from app.core.lingua import lingua
+        tabella = SUGGERIMENTI_EN if lingua() == "en" else SUGGERIMENTI
+        return tabella.get(self.codice, tabella["ERRORE_IMPREVISTO"])
 
     def come_dizionario(self) -> dict[str, Any]:
         """Forma serializzabile per payload di interrupt e risposte HTTP."""

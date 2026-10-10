@@ -1,5 +1,7 @@
 # Guida alla Personalizzazione: LangBrain
 
+🇮🇹 Italiano | 🇬🇧 [English](HOW_TO_CUSTOMIZE.en.md)
+
 Questa guida spiega come estendere e personalizzare il boilerplate per adattarlo alla tua architettura IoT o a qualsiasi altro dominio gerarchico.
 
 ---
@@ -7,6 +9,19 @@ Questa guida spiega come estendere e personalizzare il boilerplate per adattarlo
 ## 0. Installazione e Avvio del Server
 
 Serve **Python 3.12 o superiore**. Le versioni delle dipendenze sono fissate in `requirements.txt` (dirette) e `requirements.lock` (elenco completo, usato dal Dockerfile); i test si lanciano con `python -m pytest tests`.
+
+### Lingua
+
+Un'impostazione sceglie la lingua dei prompt predefiniti del Brain e degli agenti, dei messaggi dell'API e dei testi delle pagine web:
+
+```toml
+[generale]
+lingua = "it"     # oppure "en"
+```
+
+Le risposte del modello sono lette in entrambe le lingue qualunque sia l'impostazione (`DECISIONE: APPROVA` e `DECISION: APPROVE` sono la stessa cosa), e così le decisioni dell'operatore (`APPROVA`/`APPROVE`, `RESPINGI`/`REJECT`). Le chiavi JSON dell'API sono identificatori in inglese in tutte e due le lingue. Sezioni, chiavi e valori della configurazione si possono scrivere anche in inglese (tabella completa in [HOW_TO_CUSTOMIZE.en.md](HOW_TO_CUSTOMIZE.en.md#the-users-choices-configurazionetoml-or-configtoml)); [`config.example.toml`](../config.example.toml) è la versione inglese, da copiare come `config.toml` (usato quando `configurazione.toml` non esiste). I ruoli dell'API hanno anche il nome inglese, con le variabili `API_KEY_VIEWER`, `API_KEY_OPERATOR` e `API_KEY_ADMIN`.
+
+Le pagine web (`/demo`, `/config` e quelle dei nodi installati) prendono i testi da un piccolo file per lingua, `app/static/i18n/it.json` e `en.json`, con una sezione per pagina. La lingua di una pagina è, in ordine: `?lang=it` o `?lang=en` nell'indirizzo (ricordata in un cookie; il link in alto in ogni pagina la cambia), la lingua del browser, poi `[generale] lingua`. Per cambiare un'etichetta basta modificare il file: la pagina la legge al caricamento successivo.
 
 ### Test e scansione di sicurezza
 
@@ -67,6 +82,9 @@ Il payload dell'interrupt contiene `errore` (`codice`, `messaggio`, `suggeriment
 
 Il `.env` resta per **segreti e parametri d'ambiente** (chiavi API, URL, percorso del database). Le **scelte strutturate** stanno in [`configurazione.toml`](../configurazione.toml): l'elenco dei dispositivi con i valori ammessi e la politica di ripiego dei provider LLM. Priorità: variabile d'ambiente > `configurazione.toml` > default nel codice. Il file viene riletto a caldo quando cambia (se la nuova versione è errata resta attiva la precedente e l'errore compare nel log); percorso alternativo con `LANGBRAIN_CONFIG`.
 
+**Finestra dei segnali.** `[segnali] finestra_ore = 4` (in inglese `[signals] window_hours`) è quante ore di segnali dei
+recettori il grafo tiene nello stato di ogni esecuzione; gli effettori si dichiarano anche come `[effectors.<nome>]`.
+
 **Elenco esplicito dei dispositivi.** Ogni dispositivo che può ricevere comandi va dichiarato:
 
 ```toml
@@ -100,6 +118,23 @@ ordine_provider = ["google_studio", "mistral", "openrouter", "local"]  # dopo il
 openrouter = ["google/gemma-4-31b-it:free", "nvidia/nemotron-3-super-120b-a12b:free"]
 mistral = ["ministral-3b-latest"]
 ```
+
+### Pagina delle impostazioni (`/config`) e riavvio
+
+I file restano il metodo principale per configurare LangBrain. Se preferisci un modulo, apri `/config`: la pagina è
+pubblica come `/demo`, leggere i valori richiede la chiave lettore e salvare la chiave amministratore (scrivila in alto nella pagina).
+
+- Modifica **gli stessi file** (`.env`, `configurazione.toml` / `config.toml` e il file di un eventuale nodo installato):
+  commenti, ordine e i nomi che hai scritto (italiani o inglesi) restano, e la versione precedente di ogni file è salvata
+  come `<file>.bak` (**Ripristina versione precedente** la rimette).
+- Non viene scritto nulla se ogni valore non è valido e il caricatore vero non accetta il file nuovo: tutto o niente.
+- I segreti (chiavi API, password) sono solo in scrittura: la pagina mostra solo se sono impostati.
+- Un'impostazione che si legge solo all'avvio è segnata **richiede riavvio**. Il pulsante **Riavvia app** (chiave
+  amministratore; nascosto agli altri ruoli) chiama `POST /config/api/restart`: il processo si ferma come con Ctrl+C e
+  riparte con lo stesso comando. In Docker esce soltanto e ci pensa `restart: unless-stopped`; con `uvicorn --reload`
+  ci pensa il reloader. La pagina attende l'applicazione e si ricarica da sola.
+- API: `GET /config/api/fields` (lettore; dice anche `can_restart` per la chiave che chiede), `POST /config/api/save` e
+  `POST /config/api/restore` (amministratore), `POST /config/api/restart` (amministratore).
 
 ### Protezione dell'API con chiavi e ruoli
 
@@ -159,9 +194,38 @@ $$\text{Cervello (Brain - Livello 0)} \longrightarrow \text{Organo (Livello 1)} 
 
 ---
 
+### Il vocabolario del corpo umano
+
+Il framework dà alle sue parti i nomi del corpo umano, così lo stesso core va bene per ogni dominio (una casa, un impianto, una clinica, un ufficio):
+
+| Parte | Significato | Nel codice |
+|---|---|---|
+| **Brain** · **Organ** · **Tissue** · **Cell** | gli agenti che usano un modello, per livello della gerarchia (0, 1, 2, 3+) | `nome_livello(n)` in `app/core/constants.py` |
+| **Reflex** | un'azione deterministica: niente modello, nessuna decisione (una regola, una redazione, una conversione) | `app/tools/reflex.py` |
+| **Receptor** | trasforma uno stimolo esterno in un segnale; può usare un modello ma non decide nulla | `Receptor`, sottoclasse di `Reflex` |
+| **Effector** | ciò che agisce sul mondo; `SimulatedEffector` è quello in memoria | `app/tools/effectors.py`, `[effectors.*]`, `/effectors` |
+| **Signal** | una lettura di un recettore (quelle numeriche sono salvate) | tabella `signals`, campo `signals` di `POST /graph/run`, `GET /signals` |
+| **Nervous system** | il registro degli eventi: audit, blocchi, escalation | `NervousSystem` in `app/tools/nervous_system.py` |
+| **Motor control** | il modo validato in cui un comando raggiunge un effettore | `app/tools/motor_control.py` |
+
+I vecchi nomi continuano a funzionare come alias (con un `DeprecationWarning` per i moduli Python):
+
+| Vecchio | Nuovo |
+|---|---|
+| `BaseTool` (`app/tools/baseTool.py`) | `Reflex` (`app/tools/reflex.py`) |
+| `IoTDeviceTool`, `get_default_iot_tools` (`app/tools/sensor_tools.py`) | `SimulatedEffector`, `default_effectors` (`app/tools/effectors.py`) |
+| `EventLog` (`app/tools/event_log.py`) | `NervousSystem` (`app/tools/nervous_system.py`) |
+| `execute_tool_safely`, `force_execute_tool` (`app/tools/tool_wrapper.py`) | le stesse funzioni in `app/tools/motor_control.py` |
+| `sensor_readings` in `POST /graph/run`, tabella `readings` | `signals`, tabella `signals` |
+| `GET/POST /tools`, `/tools/{id}`, `/tools/{id}/fault` | `/effectors`, `/effectors/{id}`, `/effectors/{id}/fault` |
+| `[devices.*]` / `[dispositivi.*]`, `unlisted_devices` | `[effectors.*]`, `unlisted_effectors` |
+| `app/agents/agent_climate.py`, `medical_agents.py`, `app/tools/medical_tools.py` | `examples/smart_home/`, `examples/medical_homeostasis/` (gli esempi di dominio stanno fuori dal core) |
+
+---
+
 ## 2. Mappatura Completa Endpoints API REST
 
-Tutti gli endpoint disponibili in FastAPI ([`app/api/main.py`](../app/api/main.py)):
+Tutti gli endpoint disponibili in FastAPI ([`app/api/main.py`](../app/api/main.py)). I nodi installati come estensioni (sezione 10) aggiungono i propri:
 
 ### 📌 1. Sistema & Grafo Agenti
 
@@ -337,6 +401,8 @@ Tutti gli endpoint disponibili in FastAPI ([`app/api/main.py`](../app/api/main.p
 
 ### 🛠️ 3. Gestione Tool IoT (Hardware/Simulati)
 
+Nel vocabolario del corpo questa famiglia è `/effectors` (`GET/POST /effectors`, `/effectors/{id}`, `/effectors/{id}/fault`); `/tools` continua a funzionare come alias.
+
 #### `GET /tools`
 - **Descrizione:** Elenca tutti i tool IoT registrati ed il loro valore attuale.
 - **Risposta (200):**
@@ -455,6 +521,43 @@ Tutti gli endpoint disponibili in FastAPI ([`app/api/main.py`](../app/api/main.p
 
 ---
 
+### 📈 6. Statistiche per i grafici
+
+Sola lettura (chiave lettore) e con parametri generici, così il cruscotto di qualunque dominio può attingervi: la finestra in
+ore, la dimensione degli intervalli, un filtro per recettore o per agente proprietario. `GET /events/stats` (sopra) è la prima.
+
+#### `GET /graph/stats?window_hours=24`
+- **Descrizione:** come il grafo ha eseguito i suoi nodi (Brain, organi, componenti) nelle run avviate nella finestra. Ogni
+  esecuzione di un nodo è registrata (tabella `node_runs`) con durata ed esito: `ok`, `escalated`, `waiting` (il grafo si
+  è fermato per una persona) o `error`.
+- **Risposta (200):**
+  ```json
+  {
+    "generated_at": "2026-10-10T12:00:00+00:00", "window_hours": 24, "runs": 12, "waiting": 1,
+    "nodes": [{"node": "brain", "runs": 15, "outcomes": {"ok": 13, "waiting": 2}, "median_ms": 410.5, "p90_ms": 1260.0}],
+    "edges": [{"from": "__start__", "to": "brain", "count": 12}, {"from": "brain", "to": "organ_security", "count": 5}],
+    "wait_hours_median": 0.4,
+    "topology": {"nodes": ["brain", "organ_security"], "edges": [{"from": "brain", "to": "organ_security", "conditional": true}]}
+  }
+  ```
+  Le attese di una persona non contano nelle durate. Una run è identificata da `config.run_id`, assegnato da
+  `POST /graph/run`; una ripresa mantiene la stessa run.
+
+#### `GET /graph/runs?window_hours=24&run_id=&limit=50`
+- **Descrizione:** le run della finestra, dalla più recente, ognuna con i suoi passi (`node`, `started_at`, `duration_ms`,
+  `outcome`, `detail`) e se è in attesa; oppure una sola run con `run_id`.
+
+#### `GET /signals?window_hours=4&receptor_id=&limit=500`
+- **Descrizione:** i segnali numerici registrati nel sistema nervoso (dal più recente), eventualmente di un solo recettore.
+
+#### `GET /signals/stats?window_hours=24&receptor_id=&agent_owner=&bucket_minutes=`
+- **Descrizione:** per recettore: `count`, `min`, `max`, `mean`, `last` e una `series` nel tempo. La finestra è divisa in
+  intervalli di `bucket_minutes` (predefinito: 48 intervalli); un intervallo senza segnali resta nella serie con
+  `count: 0` e senza valori, così un grafico non inventa mai un punto.
+- La finestra che il grafo tiene nel suo stato è `[segnali] finestra_ore` della configurazione (predefinito 4).
+
+---
+
 ## 3. Creare un Nuovo Agente in Codice Python
 
 Per creare un agente personalizzato in Python:
@@ -566,19 +669,58 @@ Per provare il flusso senza hardware usa `POST /tools/{device_id}/fault`.
 
 Puoi personalizzare sia le istruzioni di sistema (System Prompt) che la struttura dei dati inviati al modello (User Prompt) a qualsiasi livello della gerarchia.
 
-### A. Personalizzare i Prompt dell'Orchestratore Supremo (Brain) via `.env`
+### A. Prompt del Brain, del troubleshooting e dell'override (`configurazione.toml` o `.env`)
 
-Nel file `.env` puoi sovrascrivere direttamente i prompt del `BrainAgent`:
+Ogni prompt è diviso in due parti:
 
-```env
-# System Prompt dell'Orchestratore
-BRAIN_SYSTEM_PROMPT="Sei l'Orchestratore Supremo della Smart Home. Hai ricevuto un'escalation da un sotto-agente per un conflitto o un'anomalia. Valuta il contesto e decidi se APPROVARE o RESPINGERE l'azione.\nFormato Risposta:\nDECISIONE: [APPROVA|RESPINGI]\nMOTIVAZIONE: [spiegazione]"
+- il **ruolo**: chi è il modello, cosa valuta, con quale prudenza. È la parte che si personalizza;
+- il **contratto**: il formato della risposta che il codice poi legge (`DECISIONE: [APPROVA|RESPINGI]`, `STATUS: ...`,
+  l'array JSON dell'override) e i dati di riferimento (catalogo dei valori ammessi). Lo aggiunge sempre il codice, con
+  una frase che chiede al modello di trattare letture, eventi e motivazioni come dati e non come istruzioni: un
+  prompt personalizzato non può romperlo. Se il testo descrive già il formato (contiene il marcatore, es.
+  `DECISIONE:`), il formato non viene ripetuto.
 
-# Template del User Prompt con segnaposto dinamici
-BRAIN_USER_PROMPT_TEMPLATE="Agente Richiedente: {source}\nDispositivo Target: {target}\nAzione Proposta: {action}\nMotivo Escalation: {reason}\nLetture Sensori Reali: {readings}\nStorico Eventi Recenti: {recent_events}\nQual è la risoluzione corretta?"
+| Nome in `[prompt]` | Variabile `.env` | Compito |
+|---|---|---|
+| `brain_escalation` | `PROMPT_BRAIN_ESCALATION` (o il vecchio `BRAIN_SYSTEM_PROMPT`) | il Brain decide APPROVA/RESPINGI su un'escalation |
+| `brain_escalation_utente` | `PROMPT_BRAIN_ESCALATION_UTENTE` (o `BRAIN_USER_PROMPT_TEMPLATE`) | template del messaggio (segnaposto sotto) |
+| `troubleshooting` | `PROMPT_TROUBLESHOOTING` | un dispositivo non ha eseguito un comando: RETRY o ESCALATE |
+| `override` | `PROMPT_OVERRIDE` | traduce una direttiva OVERRIDE in comandi JSON |
+| `controllo_macro` | `PROMPT_CONTROLLO_MACRO` | controllo di routine: OK o MACRO_ADJUSTMENT_REQUIRED |
+| nomi aggiunti dai nodi installati (vedi sezione 10) | `PROMPT_<NOME>` | i prompt di un nodo, definiti con `definisci_prompt` |
+
+Priorità: `.env` > `[prompt]` di `configurazione.toml` > default in [`app/core/prompt.py`](../app/core/prompt.py) (i
+prompt di un caso d'uso stanno nel suo modulo, registrati con `definisci_prompt` ed elencati in `MODULI_CON_PROMPT`). Il
+file TOML è riletto a caldo (il prompt nuovo vale dal ciclo successivo) e accetta testi su più righe:
+
+```toml
+[prompt]
+troubleshooting = """
+Sei il modulo di troubleshooting dei dispositivi medicali. Un dispositivo non ha eseguito un comando.
+- RETRY solo per errori chiaramente transitori (timeout di comunicazione) e se non ci sono ritenti già falliti.
+- In ogni altro caso ESCALATE: su un dispositivo medicale un guasto non chiaro va sempre a una persona."""
 ```
 
-#### Segnaposto disponibili per `BRAIN_USER_PROMPT_TEMPLATE`:
+Nel `.env` il testo sta su una riga e `\n` va a capo. Un template con un segnaposto non previsto o con graffe non
+bilanciate viene rifiutato: in `configurazione.toml` la nuova versione non entra in vigore (resta la precedente,
+errore nel log); dal `.env` si usa il default. Per una graffa letterale scrivi `{{` e `}}`.
+
+#### Come scrivere un buon ruolo
+
+I default sono scritti per qualsiasi dominio. Conviene specializzarli quando il dominio è noto:
+
+- **nomina i dispositivi critici** e cosa è irreversibile (una porta sbloccata, un farmaco somministrato);
+- **dai un criterio numerico** quando esiste (intervalli fisiologici, soglie di temperatura): il modello lo applica
+  meglio di un "valuta con attenzione";
+- **dì cosa fare nel dubbio**: per il Brain RESPINGI (un rifiuto è reversibile e passa all'operatore), per il
+  troubleshooting ESCALATE;
+- **non ripetere il formato**: lo aggiunge il codice; se lo scrivi, usa esattamente quello del contratto;
+- **non mettere dati variabili nel ruolo**: letture ed eventi arrivano nel messaggio utente.
+
+Un esempio completo (il prompt del Brain adattato a un impianto) è commentato in fondo a
+`configurazione.toml`.
+
+#### Segnaposto di `brain_escalation_utente`:
 | Segnaposto | Descrizione |
 |---|---|
 | `{source}` | Nome dell'agente che ha inviato l'escalation (es. `component_door_lock`) |
@@ -587,6 +729,23 @@ BRAIN_USER_PROMPT_TEMPLATE="Agente Richiedente: {source}\nDispositivo Target: {t
 | `{reason}` | Motivazione/dettagli forniti dal sotto-agente |
 | `{readings}` | Mappa delle letture in tempo reale per quel dispositivo |
 | `{recent_events}` | Lista degli eventi dal DB audit log nella finestra temporale |
+
+**Una chiamata per ciclo.** Il Brain decide tutte le escalation ricevute nello stesso ciclo con una sola chiamata al modello: con più escalation il template viene compilato per ciascuna, numerata (`ESCALATION: 1`, `ESCALATION: 2`...), lo storico degli eventi compare una volta sola in fondo, e il modello risponde con un blocco per escalation nel formato del contratto. Con un'escalation il messaggio è quello di sempre. Prima di qualsiasi chiamata o comando il Brain raccoglie le decisioni dell'operatore (flusso HITL `brain`, guasti): alla ripresa dopo una pausa nulla viene ripetuto. Le escalation decise dall'operatore non passano dal modello; se la risposta non contiene la decisione di un'escalation nessun dispositivo viene comandato e il grafo si ferma per l'operatore. Così, nel caso peggiore, ogni livello della gerarchia fa una sola chiamata.
+
+### Organi esterni (`[organismo.attori_esterni]`)
+
+Un attore che scrive sul sistema nervoso senza essere un nodo del grafo (una centrale di sicurezza, un sistema
+esterno, un agente di un altro processo) si dichiara in `configurazione.toml`:
+
+```toml
+[organismo.attori_esterni.agent_security]
+livello = 1          # 1 = organo, 2+ = componente (statistiche)
+priorita = 500.0     # peso dei suoi blocchi, come un agente registrato
+```
+
+Senza dichiarazione i suoi blocchi prevalgono sempre (priorità sconosciuta, per prudenza) e nelle statistiche compare tra
+gli "altri attori". Un agente registrato con lo stesso nome prevale sulla dichiarazione. Non diventa un nodo del grafo:
+il Brain non lo invoca e non costa chiamate al modello.
 
 ---
 
@@ -601,6 +760,8 @@ Quando crei o aggiorni un sotto-agente via API REST o nel file di configurazione
 ```
 
 Se il `system_prompt_template` personalizzato non descrive il formato della risposta (`DECISIONE: [ACTION|ESCALATE|NONE]`), il sistema lo aggiunge da solo insieme ai valori ammessi dei target: il formato è un contratto del codice, non una scelta dell'utente. Una risposta senza decisione riconoscibile non vale mai come "nessuna azione": ferma il grafo per l'operatore.
+
+Un agente con più `managed_targets` li decide tutti con **una sola chiamata al modello per ciclo**: la risposta ha un blocco per target (`TARGET: <nome>` seguito da `DECISIONE:` e `MOTIVAZIONE:`), e il sistema aggiunge questo formato anche a un prompt personalizzato che descrive solo quello a target singolo. Al modello vanno solo i target che chiedono una decisione: uno in blocco attende lo sblocco, uno con un conflitto non riconciliato sale comunque al padre; se nessuno ne ha bisogno la chiamata non parte. Nel caso migliore l'organo risolve da solo; nel peggiore ogni livello fa la propria chiamata fino al Brain. Se manca la decisione di un target nessun dispositivo viene comandato e il grafo si ferma per l'operatore. Nei segnaposto del template utente, con più target, `{target}` elenca i nomi e `{current_status}`, `{has_conflict}`, `{recently_reconciled}` riportano `target: valore` per ciascuno.
 
 #### Segnaposto disponibili per `user_prompt_template` nei Sotto-Agenti:
 | Segnaposto | Descrizione |
@@ -762,7 +923,7 @@ Il sistema risponde con il log delle azioni fisicamente eseguite:
 ```
 
 > [!NOTE]
-> Il System Prompt di Arbitrato Semantico usato dal MAO è definito in [`app/graph/orchestrator.py`](../app/graph/orchestrator.py) come `_OVERRIDE_SYSTEM_PROMPT`.
+> Il ruolo del prompt di Arbitrato Semantico si personalizza come gli altri (`override` in `[prompt]` o `PROMPT_OVERRIDE`); il formato JSON e il catalogo dei valori li aggiunge sempre il codice ([`app/core/prompt.py`](../app/core/prompt.py)).
 > Ogni azione OVERRIDE viene auditata nel DB con `actor: "Brain_Override"` e l'azione originale (es. `UNBLOCK_AND_SET`) per tracciabilità completa.
 
 ---
@@ -830,4 +991,40 @@ Il core conserva `action`, `old_value` e `new_value` come valori estensibili e n
 
 L'health check segnala questi flag come `MACRO_ADJUSTMENT_REQUIRED`, ma intenzionalmente non sceglie né applica un valore fisico sostitutivo.
 
+---
 
+## 10. Estensioni: un nodo che si aggancia all'API
+
+Un caso d'uso (un nodo: un helpdesk, un impianto, una clinica...) non fa parte del core. È un modulo che sta in `app/nodes/`
+ed espone `ESTENSIONE`, un `Estensione` ([`app/core/estensioni.py`](../app/core/estensioni.py)); l'API carica all'avvio ogni
+modulo di quella cartella e il core non importa mai un nodo per nome. Con `app/nodes/` vuota l'API funziona come il
+framework puro. Un'estensione dichiara ciò che porta con sé:
+
+| Campo | Cosa fa |
+|---|---|
+| `registra_rotte(app)` | aggiunge le sue rotte e pagine (una pagina può usare `risposta_pagina` di `app/core/pagine_web.py`) |
+| `permessi`, `rotte_pubbliche` | il ruolo minimo di ogni sua rotta `{(metodo, percorso): Ruolo}` e le sue pagine pubbliche: una rotta non classificata richiede la chiave amministratore |
+| `nav` | voci della barra in alto comune alle pagine (`VoceNav(pagina, href, chiave del testo, ordine)`; la voce delle impostazioni del core è 100) |
+| `compiti`, `chiusure` | funzioni async lanciate in background mentre l'API gira e chiamate allo spegnimento |
+| `moduli_prompt`, `alias_prompt` | moduli che definiscono prompt propri (`definisci_prompt`) e i nomi inglesi delle loro chiavi in `[prompt]` |
+| `testi` | una cartella con `<lingua>.json`: le sue sezioni si uniscono a quelle del core (`common` + una sezione per pagina) |
+| `sorgenti`, `campi` | il file TOML del nodo (percorso, intestazione, caricatore che lo valida, pagina che lo mostra come scheda) e i suoi campi nella pagina delle impostazioni |
+
+```python
+# app/nodes/mio_nodo.py
+from app.core.estensioni import Estensione, VoceNav
+from app.core.ruoli import Ruolo
+
+def registra(app):
+    app.add_api_route("/mio-nodo/api/stato", stato, methods=["GET"], tags=["Mio nodo"])
+
+ESTENSIONE = Estensione(
+    nome="mio_nodo", registra_rotte=registra,
+    permessi={("GET", "/mio-nodo/api/stato"): Ruolo.TIROCINANTE},   # lettore
+    nav=(VoceNav("mio_nodo", "/mio-nodo", "nav_mio_nodo", 20),),
+)
+```
+
+Un nodo deve usare le API generiche del core invece di copie proprie: `GET /events/stats`, `/graph/stats`,
+`/signals/stats` per i grafici, `/effectors` per ciò su cui agisce, `/config/api/*` per le sue impostazioni. Tutto è una
+chiamata API: l'integrazione lato backend è il modo di primo livello per usare LangBrain.

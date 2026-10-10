@@ -54,7 +54,19 @@ class Database:
                     ON events(target, timestamp DESC)
                 """)
 
-                # 4. Tabella Letture Sensori
+                # 4. Tabella Segnali (ex `readings`: letture dei recettori)
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS signals (
+                        signal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        receptor_id TEXT NOT NULL,
+                        agent_owner TEXT NOT NULL,
+                        value REAL NOT NULL,
+                        unit TEXT NOT NULL,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
+                # Nome storico della tabella dei segnali: accettato come alias (vuoto e non usato) finché esistono i vecchi test.
                 await db.execute("""
                     CREATE TABLE IF NOT EXISTS readings (
                         reading_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,7 +78,23 @@ class Database:
                     )
                 """)
 
-                # 5. Conflitto dimostrativo: solo se richiesto da configurazione.toml ([demo] conflitto_all_avvio = 1).
+                # 5. Esecuzioni dei nodi del grafo (traccia per le statistiche di `GET /graph/stats`)
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS node_runs (
+                        run_no INTEGER PRIMARY KEY AUTOINCREMENT,
+                        run_id TEXT NOT NULL,
+                        thread_id TEXT NOT NULL DEFAULT '',
+                        node TEXT NOT NULL,
+                        started_at TEXT NOT NULL,
+                        duration_ms REAL NOT NULL DEFAULT 0,
+                        outcome TEXT NOT NULL,
+                        detail TEXT NOT NULL DEFAULT ''
+                    )
+                """)
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_node_runs_run ON node_runs(run_id, run_no)")
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_node_runs_started ON node_runs(started_at)")
+
+                # 6. Conflitto dimostrativo: solo se richiesto da configurazione.toml ([demo] conflitto_all_avvio = 1).
                 # Di default il database non riceve dati di prova in automatico.
                 if get_configurazione().demo_conflitto_all_avvio:
                     # Elimina vecchi eventi di test simili per evitare accumuli a ogni riavvio

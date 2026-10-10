@@ -23,5 +23,6 @@ _cartella_db = tempfile.mkdtemp(prefix="langbrain_test_")
 atexit.register(shutil.rmtree, _cartella_db, ignore_errors=True)
 os.environ["DB_PATH"] = os.path.join(_cartella_db, "test.db")
 
-for _variabile in ("API_KEY", "API_KEY_TIROCINANTE", "API_KEY_MEDICO_DI_GUARDIA", "API_KEY_PRIMARIO"):
+for _variabile in ("API_KEY", "API_KEY_TIROCINANTE", "API_KEY_MEDICO_DI_GUARDIA", "API_KEY_PRIMARIO",
+                   "API_KEY_VIEWER", "API_KEY_OPERATOR", "API_KEY_ADMIN"):
     os.environ[_variabile] = ""

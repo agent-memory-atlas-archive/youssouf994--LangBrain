@@ -18,13 +18,13 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("DB_PATH", str(ROOT / "demo_medica.db"))
 
 from app.agents.agent_registry import AgentRegistry
-from app.agents.medical_agents import CardiovascularOrganAgent, RespiratoryOrganAgent
+from examples.medical_homeostasis.medical_agents import CardiovascularOrganAgent, RespiratoryOrganAgent
 from app.db.database import DB_PATH
 from app.db.scenario import crea_scenario
 from app.graph.builder import build_graph
-from app.tools.event_log import EventLog
-from app.tools.sensor_tools import registra_tool
-from app.tools.medical_tools import (
+from app.tools.nervous_system import NervousSystem
+from app.tools.effectors import registra_tool
+from examples.medical_homeostasis.medical_tools import (
     HeartRateRegulatorTool,
     LungVentilatorTool,
     deterministic_biometric_normalizer,
@@ -39,7 +39,7 @@ async def main():
 
     # 1. Database della demo azzerato a ogni esecuzione, così gli eventi di una prova non influenzano la successiva
     await crea_scenario(DB_PATH, "vuoto")
-    event_log = EventLog()
+    event_log = NervousSystem()
 
     # Istanzia i tool medici
     pacemaker = HeartRateRegulatorTool()

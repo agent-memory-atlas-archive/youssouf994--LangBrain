@@ -37,7 +37,7 @@ from app.MAO.model_access_object import PROVIDER_NOTI, normalizza_provider
 
 logger = logging.getLogger(__name__)
 
-TABELLE_DA_SVUOTARE = ("events", "readings", "agents_registry", "agent_models", "hitl_scadenze", "checkpoints", "writes")
+TABELLE_DA_SVUOTARE = ("events", "signals", "readings", "node_runs", "agents_registry", "agent_models", "hitl_scadenze", "checkpoints", "writes")
 
 # (nome, padre, target, peso, prompt)
 AGENTI_BASE = [

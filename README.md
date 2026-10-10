@@ -64,6 +64,26 @@ In pratica: **ogni nodo del grafo può essere, a sua volta, un piccolo cervello 
 
 ---
 
+## 🧬 Il vocabolario del corpo
+
+I nomi pubblici del framework sono quelli del corpo umano, così lo stesso core si adatta a ogni dominio (una casa, un impianto, una clinica):
+
+| Parte | Significato |
+|---|---|
+| **Brain · Organ · Tissue · Cell** | gli agenti che usano un modello, per livello della gerarchia |
+| **Reflex** (`app.tools.reflex`) | azione deterministica, senza modello e senza decisione |
+| **Receptor** | trasforma uno stimolo esterno in un **segnale**; può usare un modello ma non decide nulla |
+| **Effector** (`[effectors.*]`, `/effectors`) | ciò che agisce sul mondo; `SimulatedEffector` è quello in memoria |
+| **Nervous system** (`NervousSystem`) | il registro degli eventi, dei segnali e delle esecuzioni dei nodi |
+
+I vecchi nomi (`BaseTool`, `IoTDeviceTool`, `EventLog`, `[devices.*]`, `/tools`, `sensor_readings`) continuano a funzionare come alias; la tabella completa è in [`CHANGELOG.md`](CHANGELOG.md). Il **modello legge, il codice deterministico decide, il dubbio va a un umano**: i `Reflex` sono il codice che decide, gli agenti il modello che legge.
+
+### Estensioni e API prima di tutto
+
+Il core è un'API: tutto ciò che fa il framework è una chiamata REST, anche le statistiche per i grafici (`GET /events/stats`, `/graph/stats`, `/signals/stats`) e la configurazione (`/config/api/*`), con parametri generici validi per qualunque dominio. Un caso d'uso non modifica il core: un modulo in `app/nodes/` espone `ESTENSIONE` e porta le sue rotte, pagine, impostazioni e prompt ([docs/HOW_TO_CUSTOMIZE.md](docs/HOW_TO_CUSTOMIZE.md#10-estensioni-un-nodo-che-si-aggancia-allapi)). La pagina `/config` modifica gli stessi file di configurazione (`.env`, `configurazione.toml`) con un modulo; l'amministratore può **riavviare l'app** da lì.
+
+---
+
 ## 🦾 Anatomia del Sistema
 
 ```text
@@ -136,6 +156,7 @@ L'interruzione per approvazione umana può essere inserita **dinamicamente ovunq
 ```text
 LangBrain/
 ├── README.md / README.en.md
+├── CHANGELOG.md                    # Cosa è cambiato e tabella di migrazione dei nomi
 ├── REQUIREMENTS.md / REQUIREMENTS.en.md
 ├── SECURITY.md                     # Come segnalare vulnerabilità e cosa aspettarsi dalla sicurezza
 ├── CONTRIBUTING.md                 # Come contribuire
@@ -146,7 +167,7 @@ LangBrain/
 ├── requirements.lock               # Elenco completo fissato (usato dal Dockerfile)
 ├── requirements-dev.txt            # In più pytest
 ├── .env.example                    # Template dei segreti (chiavi dei provider e dell'API); il tuo .env resta fuori da Git
-├── configurazione.toml             # Scelte dell'utente: dispositivi e valori ammessi, provider LLM, HITL e timer
+├── configurazione.toml             # Scelte dell'utente: effettori e valori ammessi, provider LLM, HITL, segnali (config.example.toml: versione inglese)
 ├── run_loop.py                     # Loop event-driven con produttore di eventi dei sensori
 ├── .github/workflows/ci.yml        # CI: test su Python 3.12/3.14, scansione segreti e dipendenze
 ├── app/
@@ -154,51 +175,66 @@ LangBrain/
 │   │   └── model_access_object.py  # Model Access Object (OpenRouter, Google AI Studio, Mistral, LLM locale)
 │   ├── agents/
 │   │   ├── base_agent.py           # DNA comune di ogni agente (applica stato, priorità, escalation)
-│   │   ├── agent_climate.py        # Agente Clima nativo
-│   │   ├── dynamic_agent.py        # Agente dinamico configurabile a runtime (Livelli 1..N)
+│   │   ├── dynamic_agent.py        # Agente dinamico configurabile a runtime (Livelli 1..N), una chiamata per ciclo
 │   │   ├── agent_registry.py       # Registro gerarchico su SQLite
-│   │   └── medical_agents.py       # Agenti fisiologici (Cardiovascolare, Respiratorio)
+│   │   ├── agenti_nativi.py        # Carica per nome gli agenti nativi di esempio da examples/
+│   │   └── agent_climate.py, medical_agents.py   # Alias dei vecchi percorsi (ora in examples/)
 │   ├── core/
-│   │   ├── configurazione.py       # Lettura e validazione di configurazione.toml
-│   │   ├── constants.py            # Flag di controllo e TTL
+│   │   ├── configurazione.py       # Lettura e validazione di configurazione.toml (nomi italiani o inglesi)
+│   │   ├── constants.py            # Flag di controllo, TTL, nomi dei livelli (Brain, Organ, Tissue, Cell)
 │   │   ├── errori_llm.py           # Errori del modello classificati (token, chiave, limiti) e oscuramento segreti
+│   │   ├── estensioni.py           # Come un nodo si aggancia all'API (rotte, pagine, impostazioni, prompt)
+│   │   ├── lingua.py               # Lingua dei prompt, dei messaggi e delle pagine (it, en)
 │   │   ├── modelli_agenti.py       # Modello LLM per singolo agente, con ereditarietà dal padre
+│   │   ├── pagine_web.py           # Pagine web localizzate (testi in app/static/i18n, tema comune)
 │   │   ├── priorita.py             # Regole di priorità dei blocchi
+│   │   ├── prompt.py               # Prompt configurabili (ruolo personalizzabile, formato di risposta nel codice)
+│   │   ├── riavvio.py              # Riavvio dell'applicazione dalla pagina /config (solo amministratore)
 │   │   ├── risultati.py            # Esito strutturato di lettura/attuazione dei tool
-│   │   └── ruoli.py                # Ruoli di chi chiama l'API e matrice dei permessi
+│   │   ├── ruoli.py                # Ruoli di chi chiama l'API e matrice dei permessi
+│   │   └── settings_editor.py      # Editor di .env e configurazione.toml dietro la pagina /config
 │   ├── graph/
-│   │   ├── orchestrator.py         # Cervello (BrainAgent - Livello 0)
-│   │   ├── builder.py              # Builder del grafo LangGraph con wrapper HITL
+│   │   ├── orchestrator.py         # Cervello (BrainAgent - Livello 0), una chiamata per tutte le escalation del ciclo
+│   │   ├── builder.py              # Builder del grafo LangGraph con wrapper HITL e traccia delle esecuzioni dei nodi
 │   │   ├── hitl_config.py          # Configurazione dinamica HITL
 │   │   ├── timer_hitl.py           # Timer di attesa dell'operatore e azione alla scadenza
-│   │   └── state.py                # GraphState condiviso
+│   │   └── state.py                # GraphState condiviso (segnali con finestra temporale)
 │   ├── tools/
-│   │   ├── baseTool.py             # Classe base astratta per i tool
-│   │   ├── sensor_tools.py         # Tool smart home simulati e registry condiviso (registra_tool)
-│   │   ├── medical_tools.py        # Tool medici (Pacemaker, Ventilatore SpO2, Normalizzatore)
-│   │   ├── event_log.py            # Sistema nervoso: audit log degli eventi e sblocchi
-│   │   └── tool_wrapper.py         # Attuazione con controllo di priorità e override
+│   │   ├── reflex.py               # Reflex (azione deterministica) e Receptor (stimolo → segnale)
+│   │   ├── effectors.py            # Effettori simulati in memoria e registry condiviso (registra_tool)
+│   │   ├── motor_control.py        # Attuazione con controllo di priorità e override
+│   │   ├── nervous_system.py       # Sistema nervoso: audit log degli eventi, segnali, esecuzioni dei nodi
+│   │   ├── statistiche_eventi.py   # Indicatori del sistema nervoso (GET /events/stats)
+│   │   ├── statistiche_grafo.py    # Statistiche per i grafici: nodi del grafo e segnali nel tempo
+│   │   └── baseTool.py, sensor_tools.py, event_log.py, tool_wrapper.py, medical_tools.py   # Alias dei vecchi nomi
 │   ├── db/
-│   │   ├── database.py             # Schema SQLite (events, readings, ...)
+│   │   ├── database.py             # Schema SQLite (events, signals, node_runs, ...)
 │   │   └── scenario.py             # Scenari di dati riproducibili
 │   ├── api/
-│   │   └── main.py                 # API REST FastAPI (grafo, streaming, HITL, agenti, tool, eventi)
+│   │   ├── main.py                 # API REST FastAPI (grafo, streaming, HITL, agenti, effettori, eventi, statistiche)
+│   │   └── settings_routes.py      # Rotte della pagina /config (leggi, salva, ripristina, riavvia)
+│   ├── nodes/                      # Estensioni: i moduli messi qui si agganciano all'API (vuota nel framework puro)
 │   ├── static/
-│   │   └── demo_grafo.html         # Pagina "grafo in azione", servita su GET /demo
+│   │   ├── demo_grafo.html         # Pagina "grafo in azione", servita su GET /demo
+│   │   ├── config.html             # Pagina delle impostazioni, servita su GET /config
+│   │   ├── settings_form.js, common.css   # Modulo del form e tema comuni alle pagine
+│   │   └── i18n/                   # Testi delle pagine in italiano e inglese
 │   └── checkpointer.py             # Checkpointer LangGraph persistente su SQLite
 ├── examples/
 │   ├── avvia_demo.py               # Server + scenario di prova + pagina web del grafo
 │   ├── crea_scenario.py            # Azzera un database e crea uno scenario di prova
+│   ├── smart_home/                 # Dominio di esempio: agente Clima
 │   ├── hierarchical_pattern/
 │   │   └── demo_hierarchy.py       # Gerarchia smart home N-livelli da codice
-│   └── medical_homeostasis/
+│   └── medical_homeostasis/        # Dominio di esempio: agenti e tool fisiologici
 │       └── demo_medical_homeostasis.py # Omeostasi fisiologica e risoluzione di patologie
 ├── scripts/
 │   └── scansione_sicurezza.sh      # Scansione di segreti e dipendenze
 ├── tests/                          # Suite pytest (database temporanei, nessun LLM reale)
+├── tests_windows/                  # Gli stessi test con percorsi adatti a Windows, più quelli scritti su Windows
 └── docs/
-    ├── HOW_TO_CUSTOMIZE.md         # Guida alla personalizzazione e mappatura API
-    ├── PROJECT_STATUS.md           # Stato del progetto, limiti noti e roadmap
+    ├── HOW_TO_CUSTOMIZE.md / .en.md # Guida alla personalizzazione, mappatura API, estensioni
+    ├── PROJECT_STATUS.md / .en.md  # Stato del progetto, limiti noti e roadmap
     ├── API_SMOKE_TEST.md           # Smoke test dell'API con curl (Bash)
     └── API_SMOKE_TEST_WINDOWS.ps1  # Smoke test dell'API per PowerShell
 ```
@@ -244,6 +280,7 @@ Le demo 3 e 4 usano un proprio database (`demo_gerarchia.db`, `demo_medica.db`) 
 
 ```bash
 python -m pytest tests                 # intera suite: database temporanei, nessuna chiamata a LLM reali
+python -m pytest tests_windows         # su Windows: stessi test con percorsi adatti, più quelli scritti lì
 bash scripts/scansione_sicurezza.sh    # segreti e dipendenze vulnerabili (servono gitleaks e pip-audit)
 ```
 

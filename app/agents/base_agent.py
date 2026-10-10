@@ -8,16 +8,18 @@ from typing import Any
 from app.core.configurazione import get_configurazione
 from app.core.modelli_agenti import risolvi_modello
 from app.core.errori_llm import (
-    ErroreLLM, ISTRUZIONE_ERRORE_STANDARD, classifica_errore, interpreta_risposta_standard,
+    ErroreLLM, classifica_errore, interpreta_risposta_standard, istruzione_errore_standard,
 )
+from app.core.lingua import scegli
+from app.core.prompt import prompt_di_sistema
 from app.core.priorita import NOME_BRAIN, priorita_attore, registra_priorita, trova_blocco_prevalente
 from app.core.risultati import (
     APPLICATO, COMANDO_NON_AMMESSO, RESPINTO_PRIORITA, SOLO_LOG, TOOL_ASSENTE, TOOL_ERRORE, GIA_IMPOSTATO,
     comanda_tool, e_comando_non_ammesso, e_guasto_tool, leggi_tool, nuovo_risultato,
 )
-from app.graph.state import GraphState, EscalationItem
-from app.tools.event_log import EventLog
-from app.tools.sensor_tools import trova_tool
+from app.graph.state import GraphState, EscalationItem, filtra_segnali, finestra_segnali_ore
+from app.tools.nervous_system import NervousSystem as EventLog  # nome storico: i vecchi test lo sostituiscono con patch
+from app.tools.effectors import trova_tool
 from app.MAO.model_access_object import Mao
 
 logger = logging.getLogger(__name__)
@@ -62,7 +64,7 @@ class BaseAgent(ABC):
             recent_events = []
 
         # 3. Recupera le ultime letture dei sensori per i target gestiti
-        all_readings = state.get("readings", [])
+        all_readings = filtra_segnali(state.get("readings", []), finestra_segnali_ore(state.get("config")))
         relevant_readings = [
             r for r in all_readings 
             if r.get("sensor_id") in self.managed_targets or r.get("agent_owner") == self.name
@@ -300,19 +302,6 @@ class BaseAgent(ABC):
 
     # --- Troubleshooting dei guasti segnalati dai sotto-agenti -------------------------------------------------
 
-    _PROMPT_TROUBLESHOOTING = (
-        "Sei il modulo di troubleshooting di un sistema IoT gerarchico. Un dispositivo non ha eseguito un comando: "
-        "il primo fallimento è il motivo per cui vieni interpellato e, da solo, NON dimostra che il guasto sia permanente.\n"
-        "Regole di decisione:\n"
-        "- Scegli RETRY se l'errore è di tipo transitorio (timeout, rete, disturbo momentaneo, risorsa occupata) e "
-        "i ritenti di troubleshooting già falliti sono 0.\n"
-        "- Scegli ESCALATE se l'errore indica un guasto permanente (hardware rotto, dispositivo inesistente, comando "
-        "non valido, credenziali) oppure se almeno un ritento di troubleshooting è già fallito.\n"
-        "Rispondi ESATTAMENTE nel formato:\n"
-        "DIAGNOSI: [causa probabile e azione consigliata]\n"
-        "DECISIONE: [RETRY|ESCALATE]"
-    )
-
     @staticmethod
     def _agenti_che_hanno_tentato(escalation: dict[str, Any]) -> set[str]:
         tentativi = (escalation.get("tool_result") or {}).get("attempts", [])
@@ -355,15 +344,24 @@ class BaseAgent(ABC):
             1 for t in tool_result["attempts"]
             if t.get("phase") == "troubleshooting" and t.get("status") in ("TOOL_ERROR", "TOOL_MISSING")
         )
-        prompt_utente = (
+        esito = json.dumps({k: v for k, v in tool_result.items() if k != 'attempts'}, ensure_ascii=False, default=str)
+        tentativi = json.dumps(tool_result['attempts'], ensure_ascii=False, default=str)
+        storico_json = json.dumps(storico_sintetico, ensure_ascii=False, default=str)
+        prompt_utente = scegli(
             f"Dispositivo: {device}\n"
-            f"Esito del comando fallito: {json.dumps({k: v for k, v in tool_result.items() if k != 'attempts'}, ensure_ascii=False, default=str)}\n"
+            f"Esito del comando fallito: {esito}\n"
             f"Ritenti di troubleshooting già falliti: {ritenti_falliti}\n"
-            f"Tentativi già fatti: {json.dumps(tool_result['attempts'], ensure_ascii=False, default=str)}\n"
-            f"Storico recente del dispositivo: {json.dumps(storico_sintetico, ensure_ascii=False, default=str)}\n"
-            "Qual è la diagnosi e la decisione?"
+            f"Tentativi già fatti: {tentativi}\n"
+            f"Storico recente del dispositivo: {storico_json}\n"
+            "Qual è la diagnosi e la decisione?",
+            f"Device: {device}\n"
+            f"Outcome of the failed command: {esito}\n"
+            f"Troubleshooting retries already failed: {ritenti_falliti}\n"
+            f"Attempts already made: {tentativi}\n"
+            f"Recent history of the device: {storico_json}\n"
+            "What is the diagnosis and the decision?"
         )
-        risposta = await self.ask_brain(self._PROMPT_TROUBLESHOOTING, prompt_utente, temperature=0.0, max_tokens=2048)
+        risposta = await self.ask_brain(prompt_di_sistema("troubleshooting"), prompt_utente, temperature=0.0, max_tokens=2048)
         diagnosi, decisione = self._interpreta_diagnosi(risposta)
         logger.info(f"[{self.name}] Troubleshooting su '{device}': decisione={decisione}. {diagnosi}")
 
@@ -392,15 +390,43 @@ class BaseAgent(ABC):
                 logger.warning(f"[{self.name}] Impossibile chiudere le escalation di '{device}': {e}")
         return {"resolved": risolto, "diagnosis": diagnosi, "decision": decisione, "tool_result": tool_result}
 
+    # Il modello può rispondere in italiano o in inglese: i valori inglesi valgono come quelli italiani.
+    _SINONIMI_DECISIONE = {"APPROVE": "APPROVA", "REJECT": "RESPINGI"}
+
     @staticmethod
     def estrai_decisione(risposta: str, ammesse: tuple[str, ...]) -> str | None:
         """
-        Legge `DECISIONE: <valore>` dalla risposta del modello tollerando il markdown (`**`, backtick, corsivo).
-        Restituisce il valore in maiuscolo, oppure None se non c'è una decisione riconoscibile tra `ammesse`.
+        Legge `DECISIONE: <valore>` (o `DECISION: <value>`) dalla risposta del modello tollerando il markdown.
+        Restituisce il valore canonico in maiuscolo (APPROVE -> APPROVA), oppure None se non è tra `ammesse`.
         """
         pulita = re.sub(r"[*_`]", "", risposta or "")
-        trovata = re.search(r"DECISIONE:\s*(" + "|".join(map(re.escape, ammesse)) + r")\b", pulita, re.IGNORECASE)
-        return trovata.group(1).upper() if trovata else None
+        sinonimi = {en: it for en, it in BaseAgent._SINONIMI_DECISIONE.items() if it in ammesse}
+        valori = "|".join(map(re.escape, [*ammesse, *sinonimi]))
+        trovata = re.search(r"DECISIONE?:\s*(" + valori + r")\b", pulita, re.IGNORECASE)
+        if not trovata:
+            return None
+        valore = trovata.group(1).upper()
+        return sinonimi.get(valore, valore)
+
+    @staticmethod
+    def dividi_in_blocchi(risposta: str, etichetta: str, chiavi: list[str]) -> dict[str, str]:
+        """
+        Risposta del modello a una sola chiamata per più casi, divisa in un blocco per caso: ogni blocco inizia con la
+        riga `<etichetta>: <chiave>` (es. `TARGET: lampada`, `ESCALATION: 2`), tollerando markdown e maiuscole. Con una
+        sola chiave la risposta senza blocchi vale per quella (il formato a caso singolo). Un blocco di una chiave
+        sconosciuta o ripetuta viene ignorato; una chiave senza blocco resta senza decisione.
+        """
+        parti = re.split(rf"(?im)^[\s*_`#>-]*{re.escape(etichetta)}\s*:", risposta or "")
+        if len(parti) == 1:
+            return {chiavi[0]: risposta} if len(chiavi) == 1 else {}
+        note = {str(c).casefold(): c for c in chiavi}
+        blocchi: dict[str, str] = {}
+        for parte in parti[1:]:
+            riga, _, resto = parte.partition("\n")
+            nome = re.sub(r"[*_`'\"\[\]#]", "", riga).strip().casefold()
+            if nome in note and note[nome] not in blocchi:
+                blocchi[note[nome]] = resto
+        return blocchi
 
     @staticmethod
     def decisione_non_riconosciuta(risposta: str) -> ErroreLLM:
@@ -413,9 +439,10 @@ class BaseAgent(ABC):
     @staticmethod
     def _interpreta_diagnosi(risposta: str) -> tuple[str, str]:
         testo = (risposta or "").strip()
-        decisione = "RETRY" if re.search(r"DECISIONE:\s*RETRY", testo, re.IGNORECASE) else "ESCALATE"
-        trovata = re.search(r"DIAGNOSI:\s*(.*?)(?:\n\s*DECISIONE:|$)", testo, re.IGNORECASE | re.DOTALL)
-        diagnosi = (trovata.group(1) if trovata else testo).strip() or "Diagnosi non fornita dal modello."
+        decisione = "RETRY" if re.search(r"DECISIONE?:\s*RETRY", testo, re.IGNORECASE) else "ESCALATE"
+        trovata = re.search(r"DIAGNOS[IS]S?:\s*(.*?)(?:\n\s*DECISIONE?:|$)", testo, re.IGNORECASE | re.DOTALL)
+        diagnosi = (trovata.group(1) if trovata else testo).strip() or scegli("Diagnosi non fornita dal modello.",
+                                                                              "No diagnosis given by the model.")
         return diagnosi, decisione
 
     async def ask_brain(
@@ -433,14 +460,14 @@ class BaseAgent(ABC):
         vuota) o se dichiara di non poter rispondere: non restituisce mai un errore mascherato da risposta, così
         nessun agente prende decisioni sulla base di un testo d'errore. Il grafo si ferma per l'operatore (HITL).
         """
-        prompt_di_sistema = f"{system_prompt}\n\n{ISTRUZIONE_ERRORE_STANDARD}"
+        sistema_completo = f"{system_prompt}\n\n{istruzione_errore_standard()}"
         if provider is None and model is None:
             # Modello specifico dell'agente, ereditato dal padre se non impostato (vedi app.core.modelli_agenti).
             modello_agente = await risolvi_modello(self.name)
             provider, model = modello_agente.provider, modello_agente.model
         try:
             risposta = await self.mao.call_model(
-                prompt_di_sistema, user_prompt, temperature, max_tokens,
+                sistema_completo, user_prompt, temperature, max_tokens,
                 provider=provider, model=model, rigenera_se_troncata=True,
             )
         except ErroreLLM as e:

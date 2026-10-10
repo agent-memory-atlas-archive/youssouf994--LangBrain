@@ -11,9 +11,10 @@ from langchain_core.messages import AIMessage
 from app.agents.base_agent import BaseAgent
 from app.core.constants import is_control_flag
 from app.core.configurazione import get_configurazione
+from app.core.lingua import scegli
 from app.core.risultati import APPLICATO, GIA_IMPOSTATO, e_comando_non_ammesso, e_guasto_tool
 from app.graph.state import GraphState
-from app.tools.sensor_tools import get_default_iot_tools, trova_tool
+from app.tools.effectors import default_effectors, trova_tool
 
 logger = logging.getLogger(__name__)
 
@@ -47,39 +48,70 @@ class DynamicAgent(BaseAgent):
         self.parent_agent_name = parent_agent_name
         self.sub_agent_names = sub_agent_names or []
         self.level = level
-        self.tool_value_catalog = "\n".join(self._voce_catalogo(target) for target in (managed_targets or [])) or "- Nessun target gestito."
-        if system_prompt_template and "DECISIONE:" not in system_prompt_template:
-            # Il formato della risposta è un contratto del codice (lo legge `estrai_decisione`), non una scelta dell'utente:
-            # un prompt personalizzato che non lo descrive viene completato, altrimenti il modello non saprebbe come rispondere.
-            system_prompt_template = (
-                f"{system_prompt_template.rstrip()}\n\n"
-                f"Gestisci i target {managed_targets}. Valori validi per i device sotto il tuo dominio:\n{self.tool_value_catalog}\n"
-                "Devi decidere se eseguire un'azione (ACTION), fare escalation al Padre (ESCALATE), o fare nulla (NONE).\n"
-                "Rispondi ESATTAMENTE nel formato:\n"
-                "DECISIONE: [ACTION|ESCALATE|NONE]\n"
-                "MOTIVAZIONE: [spiegazione]"
-            )
-        self.system_prompt_template = system_prompt_template or (
-            f"Sei l'agente gerarchico '{name}' (Livello {level}). "
-            f"Gestisci i target {managed_targets}. "
-            "Compila una checklist: target, stato attuale, valore valido, azione corretta.\n"
+        self.tool_value_catalog = "\n".join(self._voce_catalogo(target) for target in (managed_targets or [])) or "-"
+        # Il formato della risposta è un contratto del codice (lo legge `estrai_decisione`), non una scelta dell'utente:
+        # un prompt personalizzato che non lo descrive viene completato. I default seguono la lingua in vigore.
+        self._custom_system_prompt = system_prompt_template
+        self._custom_user_prompt = user_prompt_template
+        self.tools = tools or default_effectors()
+
+    @property
+    def system_prompt_template(self) -> str:
+        targets, catalogo = self.managed_targets, self.tool_value_catalog
+        formato = scegli(
             "Devi decidere se eseguire un'azione (ACTION), fare escalation al Padre (ESCALATE), o fare nulla (NONE).\n"
-            "Valori validi permessi per i device sotto il tuo dominio:\n"
-            f"{self.tool_value_catalog}\n"
-            "Rispondi ESATTAMENTE nel formato:\n"
-            "DECISIONE: [ACTION|ESCALATE|NONE]\n"
-            "MOTIVAZIONE: [spiegazione]"
-        )
-        self.user_prompt_template = user_prompt_template or (
-            "Target primario: {target}\n"
+            "Rispondi ESATTAMENTE nel formato:\nDECISIONE: [ACTION|ESCALATE|NONE]\nMOTIVAZIONE: [spiegazione]",
+            "Decide whether to take an action (ACTION), escalate to your parent (ESCALATE) or do nothing (NONE).\n"
+            "Answer EXACTLY in the format:\nDECISION: [ACTION|ESCALATE|NONE]\nREASON: [explanation]")
+        if len(targets) > 1:
+            formato = self._formato_multi_target()
+        custom = self._custom_system_prompt
+        if custom:
+            if "DECISION" in custom:
+                # Un prompt che descrive solo il formato a target singolo viene completato con quello a blocchi.
+                return custom if len(targets) == 1 or "TARGET:" in custom else f"{custom.rstrip()}\n\n{formato}"
+            return (f"{custom.rstrip()}\n\n"
+                    + scegli(f"Gestisci i target {targets}. Valori validi per i device sotto il tuo dominio:\n{catalogo}\n",
+                             f"You manage the targets {targets}. Valid values for the devices of your domain:\n{catalogo}\n")
+                    + formato)
+        return scegli(
+            f"Sei l'agente gerarchico '{self.name}' (Livello {self.level}). Gestisci i target {targets}. "
+            "Compila una checklist: target, stato attuale, valore valido, azione corretta.\n"
+            f"Valori validi permessi per i device sotto il tuo dominio:\n{catalogo}\n",
+            f"You are the hierarchical agent '{self.name}' (level {self.level}). You manage the targets {targets}. "
+            "Go through a checklist: target, current state, valid value, right action.\n"
+            f"Valid values for the devices of your domain:\n{catalogo}\n") + formato
+
+    @staticmethod
+    def _formato_multi_target() -> str:
+        """Il formato a blocchi, uno per target: una sola chiamata al modello decide tutti i target dell'agente."""
+        return scegli(
+            "Per OGNI target decidi se eseguire un'azione (ACTION), fare escalation al Padre (ESCALATE) o fare nulla (NONE).\n"
+            "Rispondi ESATTAMENTE con un blocco per target, nel formato:\n"
+            "TARGET: [nome del target]\nDECISIONE: [ACTION|ESCALATE|NONE]\nMOTIVAZIONE: [spiegazione]",
+            "For EACH target decide whether to take an action (ACTION), escalate to your parent (ESCALATE) or do nothing (NONE).\n"
+            "Answer EXACTLY with one block per target, in the format:\n"
+            "TARGET: [target name]\nDECISION: [ACTION|ESCALATE|NONE]\nREASON: [explanation]")
+
+    @property
+    def user_prompt_template(self) -> str:
+        multi = len(self.managed_targets) > 1
+        return self._custom_user_prompt or scegli(
+            ("Target: {target}\n" if multi else "Target primario: {target}\n") +
             "Stato attuale letto dal tool: {current_status}\n"
             "Conflitto non riconciliato nel DB: {has_conflict}\n"
             "Riconciliazione recente: {recently_reconciled}\n"
             "Letture sensori rilevanti: {relevant_readings}\n"
             "Storico eventi recenti: {recent_events}\n"
-            "Qual è la decisione corretta?"
+            "Qual è la decisione corretta?",
+            ("Targets: {target}\n" if multi else "Main target: {target}\n") +
+            "Current state read from the tool: {current_status}\n"
+            "Unreconciled conflict in the DB: {has_conflict}\n"
+            "Recent reconciliation: {recently_reconciled}\n"
+            "Relevant sensor readings: {relevant_readings}\n"
+            "Recent events: {recent_events}\n"
+            "What is the right decision?"
         )
-        self.tools = tools or get_default_iot_tools()
 
     @staticmethod
     def _voce_catalogo(target: str) -> str:
@@ -156,123 +188,141 @@ class DynamicAgent(BaseAgent):
         if not self.managed_targets:
             return {"next_agent": self._parent_route(), "config": runtime_config}
 
-        primary_target = self.managed_targets[0]
-        tool_obj = trova_tool(primary_target, self.tools)
+        # 1-3. Stato di ogni target: lettura reale dal tool, blocchi, conflitti e riconciliazioni recenti.
+        stati = [await self._stato_target(target, recent_events) for target in self.managed_targets]
+        messaggi: list[str] = []
+        escalation: list[dict[str, Any]] = []
+        for s in stati:
+            if s["bloccato"]:
+                logger.info(f"[{self.name}] Target '{s['target']}' in stato di blocco '{s['stato']}'. In attesa sblocco.")
+                messaggi.append(f"[{self.name}] {s['target']} in blocco ({s['stato']}). In attesa.")
 
-        # 1. Readout stato reale dal tool
-        current_status = "OFF"
+        # 4. Una sola chiamata al modello per ciclo, per i target che chiedono davvero una decisione: un target bloccato
+        #    attende lo sblocco, un conflitto non riconciliato sale comunque al padre. Senza target da decidere nessuna chiamata.
+        da_decidere = [s for s in stati if not s["bloccato"] and not s["conflitto_aperto"]]
+        decisioni: dict[str, tuple[str, str]] = {}
+        if da_decidere:
+            ai_response = await self.ask_brain(self.system_prompt_template, self._prompt_utente(da_decidere, relevant_readings,
+                                                                                                  recent_events),
+                                               temperature=0.0, max_tokens=2048)
+            logger.info(f"[{self.name}] Risposta AI: {ai_response.strip().upper()}")
+            blocchi = self.dividi_in_blocchi(ai_response, "TARGET", [s["target"] for s in da_decidere])
+            # Tutte le decisioni vengono lette prima di agire: una risposta incompleta non comanda nessun dispositivo.
+            for s in da_decidere:
+                testo = blocchi.get(s["target"], "")
+                decisione = self.estrai_decisione(testo, ("ACTION", "ESCALATE", "NONE"))
+                if decisione is None:
+                    raise self.decisione_non_riconosciuta(testo or ai_response)
+                decisioni[s["target"]] = (decisione, testo.strip())
+
+        # 5. Esito di ogni target: escalation verso il padre, azione, oppure nulla.
+        for s in stati:
+            if s["bloccato"]:
+                continue
+            if s["conflitto_aperto"]:
+                esc, testo = await self._escala_target(s, scegli("conflitto non riconciliato nel registro eventi",
+                                                                  "unreconciled conflict in the event log"))
+            else:
+                decisione, risposta = decisioni[s["target"]]
+                if decisione == "ESCALATE":
+                    esc, testo = await self._escala_target(s, risposta)
+                elif decisione == "ACTION":
+                    esc, testo = await self._agisci_su_target(s, risposta)
+                else:
+                    logger.info(f"[{self.name}] Nessuna azione richiesta su {s['target']}.")
+                    esc, testo = None, (f"[{self.name}] Nessuna azione necessaria." if len(stati) == 1
+                                        else f"[{self.name}] {s['target']}: nessuna azione necessaria.")
+            if esc:
+                escalation.append(esc)
+            messaggi.append(testo)
+
+        update: dict[str, Any] = {
+            "next_agent": self._parent_route(),
+            "config": runtime_config,
+            "messages": [AIMessage(content="\n".join(messaggi))],
+        }
+        if escalation:
+            update["pending_escalations"] = escalation
+        return update
+
+    async def _stato_target(self, target: str, recent_events: list[dict]) -> dict[str, Any]:
+        """Stato reale del target (dal tool) e, dall'evento più recente che lo riguarda, conflitti e riconciliazioni."""
+        tool_obj = trova_tool(target, self.tools)
+        stato = "OFF"
         if tool_obj:
             try:
-                current_status = str(await tool_obj.get_tool_value())
+                stato = str(await tool_obj.get_tool_value())
             except Exception as e:
-                logger.error(f"[{self.name}] Errore lettura tool {primary_target}: {e}")
+                logger.error(f"[{self.name}] Errore lettura tool {target}: {e}")
+        eventi = sorted((e for e in recent_events if e.get("target") == target),
+                        key=lambda x: str(x.get("timestamp", "")), reverse=True)
+        conflitto, riconciliato, evento_conflitto = False, False, None
+        if eventi:
+            azione, attore = str(eventi[0].get("action", "")), str(eventi[0].get("actor", ""))
+            if azione.startswith("RECONCILED_") or azione.startswith("RESOLVED_") or azione.startswith("UNBLOCKED"):
+                riconciliato = True
+            elif (azione in ["FORCE_SHUTDOWN", "SECURITY_LOCK"] or azione.startswith("REJECTED_")) and attore != self.name:
+                conflitto, evento_conflitto = True, eventi[0]
+        return {"target": target, "stato": stato, "bloccato": is_control_flag(stato), "conflitto": conflitto,
+                "riconciliato": riconciliato, "conflitto_aperto": conflitto and not riconciliato,
+                "evento_conflitto": evento_conflitto}
 
-        # 2. Cortocircuito se il dispositivo è in uno stato di blocco
-        if is_control_flag(current_status):
-            logger.info(f"[{self.name}] Target '{primary_target}' in stato di blocco '{current_status}'. In attesa sblocco.")
-            return {
-                "next_agent": self._parent_route(),
-                "config": runtime_config,
-                "messages": [AIMessage(content=f"[{self.name}] {primary_target} in blocco ({current_status}). In attesa.")],
-            }
-
-        # 3. Trova l'evento più recente in ordine cronologico per questo target
-        target_events = [e for e in recent_events if e.get("target") == primary_target]
-        target_events.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
-
-        has_conflict = False
-        recently_reconciled = False
-        conflict_event = None
-
-        if target_events:
-            latest_ev = target_events[0]
-            latest_act = str(latest_ev.get("action", ""))
-            latest_actor = str(latest_ev.get("actor", ""))
-
-            if latest_act.startswith("RECONCILED_") or latest_act.startswith("RESOLVED_") or latest_act.startswith("UNBLOCKED"):
-                recently_reconciled = True
-            elif (latest_act in ["FORCE_SHUTDOWN", "SECURITY_LOCK"] or latest_act.startswith("REJECTED_")) and latest_actor != self.name:
-                has_conflict = True
-                conflict_event = latest_ev
-
-        # 4. Prompting MAO
-        user_prompt = self.user_prompt_template.format(
-            target=primary_target,
-            current_status=current_status,
-            has_conflict=has_conflict,
-            recently_reconciled=recently_reconciled,
-            relevant_readings=relevant_readings,
-            recent_events=recent_events,
-        )
-
-        ai_response = await self.ask_brain(self.system_prompt_template, user_prompt, temperature=0.0, max_tokens=2048)
-        ai_response_str = ai_response.strip().upper()
-        logger.info(f"[{self.name}] Risposta AI: {ai_response_str}")
-        decisione = self.estrai_decisione(ai_response, ("ACTION", "ESCALATE", "NONE"))
-        if decisione is None and not (has_conflict and not recently_reconciled):
-            raise self.decisione_non_riconosciuta(ai_response)
-
-        update: dict[str, Any] = {}
-        update["config"] = runtime_config
-
-        # 5. Gestione decisione ed Escalation verso il Padre
-        if (has_conflict and not recently_reconciled) or decisione == "ESCALATE":
-            reason = f"Conflitto/anomalia rilevata da {self.name}: {ai_response}"
-            logger.warning(f"[{self.name}] Escalation inviata a '{self.parent_agent_name}' per {primary_target}")
-
-            proposta = get_configurazione().valore_attivo(primary_target)
-            escalation = self.create_escalation(
-                target_device=primary_target,
-                proposed_action=proposta,
-                reason=reason,
-                conflict_detected=True,
-                context_events=[conflict_event] if conflict_event else [],
-            )
-
-            await self.event_log.log_event(
-                actor=self.name,
-                action="ESCALATION_PROPOSED",
-                target=primary_target,
-                old_value=current_status,
-                new_value=proposta,
-                reasoning=reason,
-                escalated=True,
-            )
-
-            update["pending_escalations"] = [escalation]
-            update["next_agent"] = self._parent_route()
-            update["messages"] = [AIMessage(content=f"[{self.name}] Conflitto rilevato. Escalation inviata a {self.parent_agent_name} per {primary_target}.")]
-
-        elif decisione == "ACTION" and not has_conflict:
-            reasoning = f"Azione consigliata da AI in {self.name}: {ai_response_str}"
-            valore_attivo = get_configurazione().valore_attivo(primary_target)
-            risultato = await self.applica_stato(
-                target=primary_target,
-                action="DYNAMIC_ACTION",
-                new_value=valore_attivo,
-                reasoning=reasoning,
-                escalated=False,
-                tools_map=self.tools,
-            )
-            update["next_agent"] = self._parent_route()
-            if risultato["status"] == APPLICATO:
-                update["messages"] = [AIMessage(content=f"[{self.name}] Azione eseguita su {primary_target} (applied=True).")]
-            elif risultato["status"] == GIA_IMPOSTATO:
-                update["messages"] = [AIMessage(content=f"[{self.name}] {primary_target} già impostato: nessuna azione necessaria.")]
-            else:
-                # Priorità insufficiente o guasto del dispositivo: il motivo sale al Padre nell'escalation
-                escalation = await self.escala_da_risultato(risultato, proposed_action=valore_attivo)
-                update["pending_escalations"] = [escalation]
-                if e_guasto_tool(risultato):
-                    testo = f"[{self.name}] Guasto di {primary_target}: {risultato['response']}. Escalation inviata a {self.parent_agent_name}."
-                elif e_comando_non_ammesso(risultato):
-                    testo = f"[{self.name}] Comando non ammesso su {primary_target}: {risultato['response']} Escalation inviata a {self.parent_agent_name}."
-                else:
-                    testo = f"[{self.name}] Azione su {primary_target} bloccata per priorità. Escalation inviata a {self.parent_agent_name}."
-                update["messages"] = [AIMessage(content=testo)]
+    def _prompt_utente(self, stati: list[dict[str, Any]], relevant_readings: list[dict], recent_events: list[dict]) -> str:
+        """Il template utente in vigore: con più target ogni campo elenca il valore di ciascuno (`target: valore`)."""
+        if len(stati) == 1:
+            s = stati[0]
+            valori = {"target": s["target"], "current_status": s["stato"], "has_conflict": s["conflitto"],
+                      "recently_reconciled": s["riconciliato"]}
         else:
-            logger.info(f"[{self.name}] Nessuna azione richiesta.")
-            update["next_agent"] = self._parent_route()
-            update["messages"] = [AIMessage(content=f"[{self.name}] Nessuna azione necessaria.")]
+            per_target = lambda chiave: "; ".join(f"{s['target']}: {s[chiave]}" for s in stati)  # noqa: E731
+            valori = {"target": ", ".join(s["target"] for s in stati), "current_status": per_target("stato"),
+                      "has_conflict": per_target("conflitto"), "recently_reconciled": per_target("riconciliato")}
+        return self.user_prompt_template.format(relevant_readings=relevant_readings, recent_events=recent_events, **valori)
 
-        return update
+    async def _escala_target(self, s: dict[str, Any], motivo: str) -> tuple[dict[str, Any], str]:
+        target = s["target"]
+        reason = f"Conflitto/anomalia rilevata da {self.name}: {motivo}"
+        logger.warning(f"[{self.name}] Escalation inviata a '{self.parent_agent_name}' per {target}")
+        proposta = get_configurazione().valore_attivo(target)
+        escalation = self.create_escalation(
+            target_device=target,
+            proposed_action=proposta,
+            reason=reason,
+            conflict_detected=True,
+            context_events=[s["evento_conflitto"]] if s["evento_conflitto"] else [],
+        )
+        await self.event_log.log_event(
+            actor=self.name,
+            action="ESCALATION_PROPOSED",
+            target=target,
+            old_value=s["stato"],
+            new_value=proposta,
+            reasoning=reason,
+            escalated=True,
+        )
+        return escalation, f"[{self.name}] Conflitto rilevato. Escalation inviata a {self.parent_agent_name} per {target}."
+
+    async def _agisci_su_target(self, s: dict[str, Any], risposta: str) -> tuple[dict[str, Any] | None, str]:
+        target = s["target"]
+        valore_attivo = get_configurazione().valore_attivo(target)
+        risultato = await self.applica_stato(
+            target=target,
+            action="DYNAMIC_ACTION",
+            new_value=valore_attivo,
+            reasoning=f"Azione consigliata da AI in {self.name}: {risposta.upper()}",
+            escalated=False,
+            tools_map=self.tools,
+        )
+        if risultato["status"] == APPLICATO:
+            return None, f"[{self.name}] Azione eseguita su {target} (applied=True)."
+        if risultato["status"] == GIA_IMPOSTATO:
+            return None, f"[{self.name}] {target} già impostato: nessuna azione necessaria."
+        # Priorità insufficiente o guasto del dispositivo: il motivo sale al Padre nell'escalation
+        escalation = await self.escala_da_risultato(risultato, proposed_action=valore_attivo)
+        if e_guasto_tool(risultato):
+            testo = f"[{self.name}] Guasto di {target}: {risultato['response']}. Escalation inviata a {self.parent_agent_name}."
+        elif e_comando_non_ammesso(risultato):
+            testo = f"[{self.name}] Comando non ammesso su {target}: {risultato['response']} Escalation inviata a {self.parent_agent_name}."
+        else:
+            testo = f"[{self.name}] Azione su {target} bloccata per priorità. Escalation inviata a {self.parent_agent_name}."
+        return escalation, testo

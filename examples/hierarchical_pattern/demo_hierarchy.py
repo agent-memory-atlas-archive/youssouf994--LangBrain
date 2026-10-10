@@ -26,7 +26,7 @@ from app.agents.agent_registry import AgentRegistry
 from app.db.database import DB_PATH
 from app.db.scenario import crea_scenario
 from app.graph.builder import build_graph
-from app.tools.event_log import EventLog
+from app.tools.nervous_system import NervousSystem
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("demo_hierarchy")
@@ -117,7 +117,7 @@ async def main():
 
     # 9. Simula un conflitto sull'Organo 2 / Componente Serratura per testare l'escalation ricorsiva
     logger.info("\n--- [TEST CICLO 2] Simulazione Conflitto sul Componente Serratura ---")
-    event_log = EventLog()
+    event_log = NervousSystem()
     await event_log.log_event(
         actor="user_manual",
         action="SECURITY_LOCK",

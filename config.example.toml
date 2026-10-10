@@ -1,0 +1,186 @@
+# LangBrain configuration, English version of configurazione.toml (same settings, English names).
+# Copy it as config.toml (used when configurazione.toml does not exist), or point LANGBRAIN_CONFIG to it.
+#
+# The .env file keeps secrets and environment parameters (API keys, URLs, database path). This file holds the
+# structured choices: which devices exist and which values they accept, the fallback policy of the LLM providers,
+# human-in-the-loop, prompts. Priority: environment variable > this file > defaults in the code.
+# The file is reloaded when it changes: no restart needed. If the new version is wrong, the previous one stays
+# active and the error is in the log. Italian and English names can be used; one entry must not use both.
+
+[general]
+# Language of the default prompts of the Brain and the agents, of the API messages and of the web pages: "en" or "it".
+language = "en"
+
+# ---------------------------------------------------------------------------
+# LLM models
+# ---------------------------------------------------------------------------
+[llm]
+# false: an error of the chosen provider or model stops the graph and hands over to the operator (HITL).
+# true: silently try the other providers (in the order below) and the fallback models. Overridden by MAO_FALLBACK.
+fallback = false
+
+# Order of the providers tried when fallback is on (after the provider chosen with DEFAULT_PROVIDER).
+provider_order = ["google_studio", "mistral", "openrouter", "local"]
+
+# Fallback models per provider, used only with fallback = true. Keep only free or very cheap models: the fallback
+# happens silently. With an empty list only the model configured in .env is tried.
+[llm.fallback_models]
+openrouter = ["google/gemma-4-31b-it:free", "nvidia/nemotron-3-super-120b-a12b:free"]
+mistral = ["ministral-3b-latest"]
+google_studio = ["gemini-flash-latest"]
+
+# ---------------------------------------------------------------------------
+# Human-in-the-loop: operator timer
+# ---------------------------------------------------------------------------
+[hitl]
+# 1: when the graph stops waiting for the operator, a timer starts; the time left is exposed by the API
+#    (GET /graph/state, GET /hitl/scadenze). 0: no timer, the graph waits with no limit.
+timer_enabled = 0
+
+# Default length of the timer, in seconds. `max_wait_seconds` of POST /hitl/config, if set, replaces it at runtime.
+default_timer_seconds = 300
+
+# What happens when the timer expires:
+#   "human":  the graph stays paused and waits for the operator; the API only reports that the timer expired.
+#   "system": the system decides: the request goes on as if HITL were not configured, i.e. the Brain evaluates it
+#             with its model. For emergency pauses there is nothing to decide: an unresolved fault is logged with no
+#             other action and an unavailable LLM cancels the cycle.
+#   "reject": the request is rejected automatically (no physical action is performed).
+on_timeout = "human"
+
+# Where HITL applies. Two separate flows, each with its own rules:
+#   "nodes": graph nodes stop before running (or after proposing an action), following the rules of
+#            POST /hitl/config (hitl_all, hitl_nodes, hitl_targets, hitl_actions). The Brain decides escalations alone.
+#   "brain": the Brain, when it evaluates an escalation on a protected device, asks the operator first. Nodes never stop.
+#   "both":  both flows (the same request may be asked twice).
+# Emergency pauses (unusable LLM, unresolved fault) stay active at any level.
+level = "both"
+
+# Devices for which the Brain always asks for approval in the "brain" flow, besides hitl_targets of
+# POST /hitl/config and hitl_all. Empty list: no protected device by default.
+brain_critical_targets = ["alarm_system", "front_door_lock"]
+
+# ---------------------------------------------------------------------------
+# Demo data
+# ---------------------------------------------------------------------------
+[demo]
+# 1: at every start the database gets a test conflict event (FORCE_SHUTDOWN on ac_living_room).
+# 0 (recommended): no test data is written automatically; for a test scenario use examples/crea_scenario.py.
+seed_conflict_at_start = 0
+
+# 1: the API serves the demo page on GET /demo, which shows the graph at work (see examples/avvia_demo.py).
+# The page is static and holds no secret: calls to the API still need the key. 0: /demo answers 404.
+web_page = 1
+
+# ---------------------------------------------------------------------------
+# Receptor signals
+# ---------------------------------------------------------------------------
+[signals]
+# How far back (in hours) the signals of the receptors are kept in the state of each graph run: older ones are
+# dropped. Numeric signals are also stored in the nervous system (GET /signals, GET /signals/stats).
+window_hours = 4
+
+# ---------------------------------------------------------------------------
+# Devices
+# ---------------------------------------------------------------------------
+[policy]
+# What to do with a device that is not listed below:
+#   "reject": no agent, override or API write can command it (recommended).
+#   "allow":  any value is accepted for unlisted devices.
+unlisted_devices = "reject"
+
+# Each [effectors.<name>] section lists what the device accepts as a command. The name can be a pattern with * and ?
+# (e.g. "device_l*"); the first rule that matches wins, the exact name first.
+#   values        accepted text values (case-insensitive)
+#   range         [minimum, maximum] for numeric values
+#   unit          optional unit of numbers (e.g. "°C", "%"): "22.5°C" and "22.5" are the same
+#   active_value  value sent when an agent generically decides to "activate" the device (default "ON")
+# Internal flags of the system (REJECTED, RECONCILED_*, ...) are not physical values and are never validated here.
+# A section with neither values nor range accepts any value for that device.
+
+[effectors.ac_living_room]
+values = ["OFF", "ON"]
+range = [10.0, 35.0]
+unit = "°C"
+active_value = "22.5°C"
+
+[effectors.heater_bedroom]
+values = ["OFF", "ON"]
+range = [10.0, 35.0]
+unit = "°C"
+active_value = "22.5°C"
+
+[effectors.front_door_lock]
+values = ["LOCKED", "UNLOCKED"]
+active_value = "LOCKED"
+
+[effectors.alarm_system]
+values = ["ARMED", "DISARMED"]
+active_value = "ARMED"
+
+[effectors.living_room_lights]
+values = ["ON", "OFF"]
+range = [0.0, 100.0]
+unit = "%"
+active_value = "ON"
+
+[effectors.cardiac_pacemaker]
+range = [30.0, 220.0]
+unit = "BPM"
+
+[effectors.oxygen_regulator]
+range = [0.0, 100.0]
+unit = "%"
+
+# Devices used by the demos and the smoke-test scripts.
+[effectors.vault_door]
+values = ["LOCKED", "UNLOCKED", "OPEN", "CLOSED"]
+active_value = "LOCKED"
+
+[effectors.security_perimeter]
+values = ["ON", "OFF"]
+
+[effectors.access_control]
+values = ["ON", "OFF"]
+
+[effectors."device_l*"]
+values = ["ON", "OFF"]
+
+# ---------------------------------------------------------------------------
+# Organism: external organs
+# ---------------------------------------------------------------------------
+# Actors that write events on the nervous system without being graph nodes (a security panel, an external system,
+# an agent of another process). The level places them in the hierarchy (1 = organ, 2+ = component) in the statistics; the priority weighs their locks on devices like that of a registered agent (without a declared
+# priority, a lock of an unknown actor always prevails, to be safe). A registered agent with the same name prevails.
+[organism.external_actors.agent_security]
+level = 1
+priority = 500.0
+description = "Security organ: locks devices when it detects a risk (e.g. window open with the air conditioning on)."
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+# Text of the ROLE of the model for each task. The code always adds the reference data (catalogue of accepted values)
+# and the answer format it then reads: a custom prompt cannot break them. If the text already describes the format
+# (contains "DECISION:", "DECISIONE:", "STATUS:" or, for the override, "\"target\"") the format is not repeated.
+# The PROMPT_* environment variables of .env prevail over this section. Without a custom text, the default prompt in
+# the language of [general] is used.
+#
+#   brain_escalation         the Brain decides APPROVE/REJECT on an escalation of an organ
+#   brain_escalation_user    message template; placeholders: {source} {target} {action} {reason} {readings}
+#                            {recent_events} (for a literal brace: {{ and }})
+#   troubleshooting          a device did not run a command: RETRY or ESCALATE
+#   override                 turns an OVERRIDE directive of the operator into JSON commands
+#   routine_check            routine check of the global state: OK or MACRO_ADJUSTMENT_REQUIRED
+#
+# Add to the role what is true only for your plant. Example (remove the comment; it applies from the next cycle;
+# the text replaces the default role, so it repeats its rules):
+#
+# [prompts]
+# brain_escalation = """
+# You are the Brain of a hydroelectric plant: you decide on the escalations of the organs that control turbines and gates.
+# Proceed like this:
+# 1. Identify the device, the proposed action and who proposes it.
+# 2. Compare the real readings with the history: is there an active lock of an actor with higher priority?
+# 3. Check that the proposed value is among those the catalogue allows.
+# 4. When in doubt, or when the action concerns safety and the data are incomplete, REJECT."""

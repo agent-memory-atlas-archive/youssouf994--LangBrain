@@ -6,7 +6,12 @@
 # Il file viene riletto a caldo quando cambia: non serve riavviare il server. Se la nuova versione è errata resta
 # attiva la precedente e l'errore compare nel log.
 #
-# Percorso alternativo: variabile d'ambiente LANGBRAIN_CONFIG.
+# Percorso alternativo: variabile d'ambiente LANGBRAIN_CONFIG. Ogni nome si può scrivere anche in inglese
+# (config.example.toml è questo file in inglese, da copiare come config.toml).
+
+[generale]
+# Lingua dei prompt predefiniti del Brain e degli agenti, dei messaggi dell'API e delle pagine web: "it" o "en".
+lingua = "it"
 
 # ---------------------------------------------------------------------------
 # Modelli LLM
@@ -73,6 +78,14 @@ conflitto_all_avvio = 0
 pagina_web = 1
 
 # ---------------------------------------------------------------------------
+# Segnali dei recettori
+# ---------------------------------------------------------------------------
+[segnali]
+# Quanto indietro (in ore) si tengono i segnali dei recettori nello stato di ogni esecuzione del grafo: i più vecchi
+# vengono scartati. I segnali numerici sono anche salvati nel sistema nervoso (GET /signals, GET /signals/stats).
+finestra_ore = 4
+
+# ---------------------------------------------------------------------------
 # Dispositivi
 # ---------------------------------------------------------------------------
 [politica]
@@ -137,3 +150,44 @@ valori = ["ON", "OFF"]
 
 [dispositivi."device_l*"]
 valori = ["ON", "OFF"]
+
+# ---------------------------------------------------------------------------
+# Organismo: organi esterni
+# ---------------------------------------------------------------------------
+# Attori che scrivono eventi sul sistema nervoso senza essere nodi del grafo (una centrale di sicurezza, un sistema
+# esterno, un agente di un altro processo). Il livello li colloca nella gerarchia (1 = organo, 2+ = componente) nelle
+# statistiche; la priorità pesa i loro blocchi sui dispositivi come quella di un agente registrato
+# (senza priorità dichiarata un blocco di un attore sconosciuto prevale sempre, per prudenza).
+# Un agente registrato con lo stesso nome prevale su questa dichiarazione.
+[organismo.attori_esterni.agent_security]
+livello = 1
+priorita = 500.0
+descrizione = "Organo di sicurezza: blocca i dispositivi quando rileva un rischio (es. finestra aperta con il clima acceso)."
+
+# ---------------------------------------------------------------------------
+# Prompt
+# ---------------------------------------------------------------------------
+# Testo del RUOLO del modello per ciascun compito. Il codice aggiunge sempre i dati di riferimento (catalogo dei
+# valori ammessi) e il formato della risposta che poi legge: un prompt personalizzato non può romperli. Se il testo
+# descrive già il formato (contiene "DECISIONE:", "STATUS:" o, per l'override, "\"target\"") il formato non viene
+# ripetuto. Le variabili d'ambiente PROMPT_* del .env prevalgono su questa sezione.
+#
+#   brain_escalation         il Brain decide APPROVA/RESPINGI su un'escalation di un organo
+#   brain_escalation_utente  template del messaggio; segnaposto ammessi: {source} {target} {action} {reason}
+#                            {readings} {recent_events} (per una graffa letterale: {{ e }})
+#   troubleshooting          un dispositivo non ha eseguito un comando: RETRY o ESCALATE
+#   override                 traduce una direttiva OVERRIDE dell'operatore in comandi JSON
+#   controllo_macro          controllo di routine dello stato globale: OK o MACRO_ADJUSTMENT_REQUIRED
+#
+# Senza questa sezione valgono i default (app/core/prompt.py).
+# Conviene aggiungere al ruolo ciò che vale solo per il tuo impianto. Esempio (tolto il commento, vale dal ciclo
+# successivo; il testo sostituisce il ruolo predefinito, quindi riporta anche le sue regole):
+#
+# [prompt]
+# brain_escalation = """
+# Sei il Brain di un impianto idroelettrico: decidi sulle escalation degli organi che controllano turbine e paratoie.
+# Procedi così:
+# 1. Identifica dispositivo, azione proposta e chi la propone.
+# 2. Confronta le letture reali con lo storico: c'è un blocco attivo di un attore con priorità maggiore?
+# 3. Verifica che il valore proposto sia tra quelli ammessi dal catalogo.
+# 4. Nel dubbio, o se l'azione riguarda la sicurezza e i dati sono incompleti, RESPINGI."""

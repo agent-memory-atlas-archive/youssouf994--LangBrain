@@ -2,7 +2,7 @@
 Registry ed Abilitatore Dinamico di Agenti Gerarchici.
 Consente all'utente di definire, creare, elencare e rimuovere N sotto-agenti a runtime.
 Supporta una struttura gerarchica ad albero a N livelli:
-  Cervello (Brain - Livello 0) -> Organi (Livello 1) -> Componenti dell'Organo (Livello 2) -> N Sotto-Agente (Livello N)
+  Brain (Livello 0) -> Organ (Livello 1) -> Tissue (Livello 2) -> Cell (Livello 3 e oltre)
 
 Catena di comando: un agente che non sa risolvere una situazione la passa al proprio padre,
 fino al Brain. La routine si esaurisce ai livelli bassi; al Brain arrivano solo le anomalie.
@@ -23,10 +23,12 @@ import re
 from typing import Any
 import aiosqlite
 
+from app.agents.agenti_nativi import crea_agente_nativo
 from app.agents.base_agent import BaseAgent
 from app.agents.dynamic_agent import DynamicAgent
+from app.core.constants import nome_livello
 from app.db.database import DB_PATH
-from app.tools.sensor_tools import get_default_iot_tools
+from app.tools.effectors import default_effectors
 
 logger = logging.getLogger(__name__)
 
@@ -366,16 +368,16 @@ class AgentRegistry:
         """
         Istanzia tutti gli agenti dinamici registrati pronti per l'inserimento nei nodi LangGraph.
         """
-        shared_tools = tools or get_default_iot_tools()
+        shared_tools = tools or default_effectors()
         configs = await self.get_all_agent_configs()
 
         instances: dict[str, BaseAgent] = {}
         for cfg in configs:
             name = cfg["name"]
             # Se è l'agente climate standard nativo
-            if name == "agent_climate":
-                from app.agents.agent_climate import ClimateAgent
-                instances[name] = ClimateAgent(tools=shared_tools)
+            nativo = crea_agente_nativo(name, shared_tools)
+            if nativo is not None:
+                instances[name] = nativo
             else:
                 instances[name] = DynamicAgent(
                     name=name,
@@ -408,11 +410,12 @@ class AgentRegistry:
             return {
                 "name": agent_name,
                 "level": level,
+                "level_name": nome_livello(level),
                 "children": [build_branch(child["name"], child["level"]) for child in children_configs],
             }
 
         return {
             "root": "Brain",
-            "title": "Gerarchia IoT: Cervello -> Organi -> Componenti dell'Organo",
+            "title": "Hierarchy: Brain -> Organs -> Tissues -> Cells",
             "tree": build_branch("Brain", 0),
         }

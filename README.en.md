@@ -65,6 +65,26 @@ In practice, **every graph node can in turn act as a small brain for the level b
 
 ---
 
+## 🧬 The vocabulary of the body
+
+The public names of the framework are those of the human body, so the same core fits any domain (a home, a plant, a clinic):
+
+| Part | Meaning |
+|---|---|
+| **Brain · Organ · Tissue · Cell** | the agents that use a model, by level of the hierarchy |
+| **Reflex** (`app.tools.reflex`) | a deterministic action, no model and no decision |
+| **Receptor** | turns an outside stimulus into a **signal**; it may use a model but decides nothing |
+| **Effector** (`[effectors.*]`, `/effectors`) | the thing that acts on the world; `SimulatedEffector` is the in-memory one |
+| **Nervous system** (`NervousSystem`) | the log of events, signals and node runs |
+
+The old names (`BaseTool`, `IoTDeviceTool`, `EventLog`, `[devices.*]`, `/tools`, `sensor_readings`) keep working as aliases; the full table is in [`CHANGELOG.md`](CHANGELOG.md). The **model reads, deterministic code decides, doubt goes to a human**: `Reflex`es are the code that decides, agents the model that reads.
+
+### Extensions and API first
+
+The core is an API: everything the framework does is a REST call, including the statistics for charts (`GET /events/stats`, `/graph/stats`, `/signals/stats`) and the configuration (`/config/api/*`), with generic parameters that fit any domain. A use case does not change the core: a module in `app/nodes/` exposes `ESTENSIONE` and brings its own routes, pages, settings and prompts ([docs/HOW_TO_CUSTOMIZE.en.md](docs/HOW_TO_CUSTOMIZE.en.md#10-extensions-a-node-that-plugs-into-the-api)). The `/config` page edits the same configuration files (`.env`, `configurazione.toml`) with a form; the administrator can **restart the app** from there.
+
+---
+
 ## 🦾 System Anatomy
 
 ```text
@@ -139,6 +159,7 @@ Human-approval interruptions can be inserted **dynamically anywhere in the graph
 ```text
 LangBrain/
 ├── README.md / README.en.md
+├── CHANGELOG.md                    # What changed and the migration table of the names
 ├── REQUIREMENTS.md / REQUIREMENTS.en.md
 ├── SECURITY.md                     # How to report vulnerabilities and what to expect from security
 ├── CONTRIBUTING.md                 # How to contribute
@@ -148,60 +169,75 @@ LangBrain/
 ├── requirements.txt                # Direct dependencies, exact versions
 ├── requirements.lock               # Full pinned list (used by the Dockerfile)
 ├── requirements-dev.txt            # Plus pytest
-├── .env.example                    # Secrets template (provider and API keys); your .env stays out of Git
-├── configurazione.toml             # User choices: devices and allowed values, LLM providers, HITL and timer
-├── run_loop.py                     # Event-driven loop with a sensor event producer
-├── .github/workflows/ci.yml        # CI: tests on Python 3.12/3.14, secrets and dependency scan
+├── .env.example                    # Template of the secrets (provider and API keys); your .env stays out of Git
+├── configurazione.toml             # User choices: effectors and accepted values, LLM providers, HITL, signals (config.example.toml: English version)
+├── run_loop.py                     # Event-driven loop with a producer of sensor events
+├── .github/workflows/ci.yml        # CI: tests on Python 3.12/3.14, secret and dependency scan
 ├── app/
 │   ├── MAO/
 │   │   └── model_access_object.py  # Model Access Object (OpenRouter, Google AI Studio, Mistral, local LLM)
 │   ├── agents/
-│   │   ├── base_agent.py           # Common DNA of every agent (apply state, priority, escalation)
-│   │   ├── agent_climate.py        # Native Climate agent
-│   │   ├── dynamic_agent.py        # Runtime-configurable dynamic agent (Levels 1..N)
+│   │   ├── base_agent.py           # Common DNA of every agent (applies state, priorities, escalation)
+│   │   ├── dynamic_agent.py        # Agent configurable at runtime (Levels 1..N), one model call per cycle
 │   │   ├── agent_registry.py       # Hierarchical registry on SQLite
-│   │   └── medical_agents.py       # Physiological agents (Cardiovascular, Respiratory)
+│   │   ├── agenti_nativi.py        # Loads the native example agents from examples/ by name
+│   │   └── agent_climate.py, medical_agents.py   # Aliases of the old paths (now in examples/)
 │   ├── core/
-│   │   ├── configurazione.py       # Reads and validates configurazione.toml
-│   │   ├── constants.py            # Control flags and TTL
+│   │   ├── configurazione.py       # Reading and validation of configurazione.toml (Italian or English names)
+│   │   ├── constants.py            # Control flags, TTL, level names (Brain, Organ, Tissue, Cell)
 │   │   ├── errori_llm.py           # Classified model errors (tokens, key, limits) and secret masking
-│   │   ├── modelli_agenti.py       # Per-agent LLM model, inherited from the parent
+│   │   ├── estensioni.py           # How a node plugs into the API (routes, pages, settings, prompts)
+│   │   ├── lingua.py               # Language of prompts, messages and pages (it, en)
+│   │   ├── modelli_agenti.py       # LLM model per agent, inherited from the parent
+│   │   ├── pagine_web.py           # Localised web pages (texts in app/static/i18n, shared theme)
 │   │   ├── priorita.py             # Priority rules for locks
-│   │   ├── risultati.py            # Structured result of tool reads/commands
-│   │   └── ruoli.py                # Roles of API callers and the permission matrix
+│   │   ├── prompt.py               # Configurable prompts (customisable role, answer format in the code)
+│   │   ├── riavvio.py              # Restart of the application from the /config page (admin only)
+│   │   ├── risultati.py            # Structured outcome of tool reading/actuation
+│   │   ├── ruoli.py                # Roles of API callers and permission matrix
+│   │   └── settings_editor.py      # Editor of .env and configurazione.toml behind the /config page
 │   ├── graph/
-│   │   ├── orchestrator.py         # Brain (BrainAgent - Level 0)
-│   │   ├── builder.py              # LangGraph builder with HITL wrapper
+│   │   ├── orchestrator.py         # Brain (BrainAgent - Level 0), one call for all the escalations of the cycle
+│   │   ├── builder.py              # LangGraph builder with HITL wrapper and trace of the node runs
 │   │   ├── hitl_config.py          # Dynamic HITL configuration
-│   │   ├── timer_hitl.py           # Operator wait timer and action on expiry
-│   │   └── state.py                # Shared GraphState
+│   │   ├── timer_hitl.py           # Operator wait timer and action at expiry
+│   │   └── state.py                # Shared GraphState (signals with a time window)
 │   ├── tools/
-│   │   ├── baseTool.py             # Abstract base class for tools
-│   │   ├── sensor_tools.py         # Simulated smart home tools and shared registry (registra_tool)
-│   │   ├── medical_tools.py        # Medical tools (Pacemaker, SpO2 ventilator, Normalizer)
-│   │   ├── event_log.py            # Nervous system: event audit log and unblocks
-│   │   └── tool_wrapper.py         # Actuation with priority check and override
+│   │   ├── reflex.py               # Reflex (deterministic action) and Receptor (stimulus → signal)
+│   │   ├── effectors.py            # Simulated in-memory effectors and shared registry (registra_tool)
+│   │   ├── motor_control.py        # Actuation with priority check and override
+│   │   ├── nervous_system.py       # Nervous system: event audit log, signals, node runs
+│   │   ├── statistiche_eventi.py   # Nervous system indicators (GET /events/stats)
+│   │   ├── statistiche_grafo.py    # Statistics for charts: graph nodes and signals over time
+│   │   └── baseTool.py, sensor_tools.py, event_log.py, tool_wrapper.py, medical_tools.py   # Aliases of the old names
 │   ├── db/
-│   │   ├── database.py             # SQLite schema (events, readings, ...)
+│   │   ├── database.py             # SQLite schema (events, signals, node_runs, ...)
 │   │   └── scenario.py             # Reproducible data scenarios
 │   ├── api/
-│   │   └── main.py                 # FastAPI REST API (graph, streaming, HITL, agents, tools, events)
+│   │   ├── main.py                 # FastAPI REST API (graph, streaming, HITL, agents, effectors, events, statistics)
+│   │   └── settings_routes.py      # Routes of the /config page (read, save, restore, restart)
+│   ├── nodes/                      # Extensions: modules put here plug into the API (empty in the plain framework)
 │   ├── static/
-│   │   └── demo_grafo.html         # "Graph in action" page, served on GET /demo
+│   │   ├── demo_grafo.html         # "Graph at work" page, served on GET /demo
+│   │   ├── config.html             # Settings page, served on GET /config
+│   │   ├── settings_form.js, common.css   # Form module and theme shared by the pages
+│   │   └── i18n/                   # Page texts in Italian and English
 │   └── checkpointer.py             # Persistent LangGraph checkpointer on SQLite
 ├── examples/
-│   ├── avvia_demo.py               # Server + sample scenario + graph web page
-│   ├── crea_scenario.py            # Resets a database and creates a sample scenario
+│   ├── avvia_demo.py               # Server + test scenario + web page of the graph
+│   ├── crea_scenario.py            # Resets a database and creates a test scenario
+│   ├── smart_home/                 # Example domain: Climate agent
 │   ├── hierarchical_pattern/
 │   │   └── demo_hierarchy.py       # N-level smart home hierarchy from code
-│   └── medical_homeostasis/
+│   └── medical_homeostasis/        # Example domain: physiological agents and tools
 │       └── demo_medical_homeostasis.py # Physiological homeostasis and pathology resolution
 ├── scripts/
-│   └── scansione_sicurezza.sh      # Secrets and dependency scan
+│   └── scansione_sicurezza.sh      # Secret and dependency scan
 ├── tests/                          # pytest suite (temporary databases, no real LLM)
+├── tests_windows/                  # The same tests with Windows-friendly paths, plus those written on Windows
 └── docs/
-    ├── HOW_TO_CUSTOMIZE.md         # Customization guide and API map
-    ├── PROJECT_STATUS.md           # Project status, known limits and roadmap
+    ├── HOW_TO_CUSTOMIZE.md / .en.md # Customisation guide, API map, extensions
+    ├── PROJECT_STATUS.md / .en.md  # Project status, known limits and roadmap
     ├── API_SMOKE_TEST.md           # API smoke test with curl (Bash)
     └── API_SMOKE_TEST_WINDOWS.ps1  # API smoke test for PowerShell
 ```
@@ -247,6 +283,7 @@ Demos 3 and 4 use their own databases (`demo_gerarchia.db`, `demo_medica.db`) an
 
 ```bash
 python -m pytest tests                 # whole suite: temporary databases, no real LLM calls
+python -m pytest tests_windows         # on Windows: the same tests with suitable paths, plus those written there
 bash scripts/scansione_sicurezza.sh    # secrets and vulnerable dependencies (needs gitleaks and pip-audit)
 ```
 

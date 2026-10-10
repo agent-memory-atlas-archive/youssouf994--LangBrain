@@ -32,10 +32,18 @@ def registra_priorita(nome: str, peso: float) -> None:
 
 
 def priorita_attore(attore: str) -> float | None:
-    """Restituisce il peso dell'attore, oppure None se non è noto."""
+    """
+    Restituisce il peso dell'attore, oppure None se non è noto. Un agente istanziato nel processo prevale su un
+    attore esterno omonimo dichiarato in configurazione.toml ([organismo.attori_esterni]).
+    """
     if attore == NOME_BRAIN:
         return PRIORITA_BRAIN
-    return _priorita_note.get(attore)
+    if attore in _priorita_note:
+        return _priorita_note[attore]
+    from app.core.configurazione import get_configurazione
+
+    esterno = get_configurazione().attori_esterni.get(attore)
+    return esterno.priorita if esterno else None
 
 
 def trova_blocco_prevalente(

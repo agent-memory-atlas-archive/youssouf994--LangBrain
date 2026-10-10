@@ -1,10 +1,12 @@
 import operator
 from typing import Annotated, TypedDict, Any
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
+
+from app.core.constants import FINESTRA_SEGNALI_ORE_PREDEFINITA
 
 # --- Modelli Pydantic per i Dati ---
 
@@ -60,14 +62,46 @@ def reduce_escalations(current: list[dict] | None, update: list[dict] | None) ->
             unite[posizione] = item
     return unite
 
+FINESTRA_SEGNALI_ORE = FINESTRA_SEGNALI_ORE_PREDEFINITA
+"""Finestra predefinita dei segnali nello stato (ore). Si cambia per run con `config["signals_window_hours"]`."""
+
+def finestra_segnali_ore(config: dict | None) -> float:
+    """Finestra dei segnali in ore: `signals_window_hours` (o il nome storico `readings_window_hours`) o il default."""
+    config = config or {}
+    for chiave in ("signals_window_hours", "readings_window_hours"):
+        try:
+            valore = float(config[chiave])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if valore > 0:
+            return valore
+    return FINESTRA_SEGNALI_ORE
+
+def _recente(segnale: dict, limite: datetime) -> bool:
+    """True se il segnale è dentro la finestra. Senza `timestamp` valido non si può datare: lo si tiene."""
+    try:
+        quando = datetime.fromisoformat(str(segnale["timestamp"]))
+    except (KeyError, ValueError):
+        return True
+    if quando.tzinfo is None:
+        quando = quando.replace(tzinfo=timezone.utc)
+    return quando >= limite
+
+def filtra_segnali(segnali: list[dict], ore: float) -> list[dict]:
+    """Tiene solo i segnali degli ultimi `ore` ore."""
+    limite = datetime.now(timezone.utc) - timedelta(hours=ore)
+    return [s for s in segnali if _recente(s, limite)]
+
 def reduce_readings(current: list[dict] | None, update: list[dict] | None) -> list[dict]:
     """
     Se update è una lista vuota [], azzera la lista.
-    Altrimenti accumula lo storico delle letture nel ciclo di esecuzione.
+    Altrimenti accumula lo storico dei segnali nel ciclo di esecuzione, scartando quelli più vecchi della
+    finestra predefinita (`FINESTRA_SEGNALI_ORE`): il reducer non vede `config`, quindi la finestra per run
+    si applica in lettura con `filtra_segnali`.
     """
     if update == []:
         return []
-    return (current or []) + (update or [])
+    return filtra_segnali((current or []) + (update or []), FINESTRA_SEGNALI_ORE)
 
 # --- Stato Condiviso del Grafo LangGraph ---
 
@@ -75,7 +109,7 @@ class GraphState(TypedDict):
     # Standard LangGraph conversation messages reducer
     messages: Annotated[list[BaseMessage], add_messages]
     
-    # Storico letture sensori accumulato (finestra temporale di N ore configurabile via config)
+    # Segnali dei recettori accumulati (finestra di N ore: `config["signals_window_hours"]`, default 4)
     readings: Annotated[list[dict], reduce_readings]
     
     # Storico eventi recenti dal DB (es. ultimi 5-10 min per audit/conflitti)
@@ -88,5 +122,5 @@ class GraphState(TypedDict):
     next_agent: str
     hitl_required: bool
     
-    # Configurazione dinamica (es. {"readings_window_hours": 4, "hitl_nodes": ["brain", "security"]})
+    # Configurazione dinamica (es. {"signals_window_hours": 4, "hitl_nodes": ["brain", "security"]})
     config: dict[str, Any]

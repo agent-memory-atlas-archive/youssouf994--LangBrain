@@ -1,5 +1,7 @@
 # Stato del progetto LangBrain
 
+🇮🇹 Italiano | 🇬🇧 [English](PROJECT_STATUS.en.md)
+
 Aggiornato il 2026-09-20. La versione precedente di questo documento era un audit statico con l'elenco dei difetti trovati; quei difetti sono stati corretti (la cronologia Git conserva l'audit originale) e qui resta lo stato attuale, i limiti noti e la roadmap.
 
 ## Sintesi
@@ -19,7 +21,11 @@ LangBrain è un boilerplate funzionante per sistemi di agenti gerarchici su Lang
 | HITL | Due flussi separati (wrapper sui nodi, approvazione del Brain sulle escalation) scelti con `[hitl] livello`; pause di emergenza sempre attive; timer con azione alla scadenza (`sistema`, `respingi`, `umano`); decisioni `APPROVA`, `RESPINGI`, `OVERRIDE` (quest'ultimo con arbitrato semantico dell'LLM). |
 | Persistenza | Checkpointer `AsyncSqliteSaver` sullo stesso file di `DB_PATH`: thread, interrupt pendenti e scadenze HITL sopravvivono a riavvii e ricompilazioni del grafo. |
 | Sicurezza API | Tre ruoli con chiavi separate (`tirocinante`, `medico_di_guardia`, `primario`), matrice dei permessi con rifiuto per impostazione predefinita, un test verifica che ogni rotta sia classificata. Vedi `SECURITY.md`. |
+| Lingue | Italiano e inglese: nomi della configurazione, ruoli e variabili d'ambiente accettati in entrambe le lingue; `[generale] lingua` sceglie i prompt predefiniti, i messaggi dell'API e i testi delle pagine; risposte del modello e decisioni dell'operatore sono lette in entrambe le lingue. |
 | Streaming | `POST /graph/run/stream` e `/graph/resume/stream` (Server-Sent Events, un evento per nodo) e la pagina `GET /demo` che mostra il grafo in azione. |
+| Statistiche per i grafici | `GET /events/stats`, `GET /graph/stats`, `GET /graph/runs`, `GET /signals`, `GET /signals/stats`: indicatori del sistema nervoso, delle run del grafo e dei segnali, con parametri generici. |
+| Pagina impostazioni | `/config`: modifica `.env` e `configurazione.toml` (e i file dei nodi installati); l'amministratore può riavviare l'app. |
+| Estensioni | `app/nodes/`: un nodo si aggancia all'API (rotte, pagine, impostazioni, prompt) senza che il core lo conosca. |
 | Dipendenze | Versioni esatte in `requirements.txt`, elenco completo in `requirements.lock`; `pip-audit` non trova vulnerabilità note. |
 | Test | `python -m pytest tests`: database temporanei, nessun LLM reale, i database veri non vengono mai toccati. Prove per mutazione sui punti critici; prove reali con Mistral/OpenRouter/Gemini eseguite a mano durante lo sviluppo. |
 | CI e sicurezza | `.github/workflows/ci.yml` (test su Python 3.12 e 3.14, gitleaks, pip-audit), `scripts/scansione_sicurezza.sh`, `SECURITY.md`, `CONTRIBUTING.md`. La CI è scritta ma non ancora eseguita su GitHub: il primo push la proverà. |
@@ -29,11 +35,11 @@ LangBrain è un boilerplate funzionante per sistemi di agenti gerarchici su Lang
 
 - **Un solo worker.** Tool, configurazione HITL a runtime (`/hitl/config`) e grafo sono in memoria del processo; checkpoint e scadenze HITL stanno su SQLite. La ricompilazione del grafo è serializzata da un lock, ma più processi diverrebbero incoerenti.
 - **Stato fisico dei tool in memoria**, non riconciliato con il DB al riavvio; i tool sono simulati (nessun adapter hardware, MQTT o webhook).
-- **`DynamicAgent` gestisce solo il primo target** di `managed_targets` quando ha target diretti.
 - **Dati non usati o non limitati**: la tabella `readings` non viene popolata; `GraphState.reduce_readings` accumula senza finestra temporale.
-- **Registro eventi**: timestamp SQLite al secondo (eventi simultanei senza ordine garantito); gli errori DB in `mark_resolved`, `unblock_target` e TTL sono registrati nei log ma non propagati all'API.
+- **Registro eventi**: timestamp SQLite al secondo (eventi simultanei senza ordine garantito); gli errori DB in `mark_resolved`, `unblock_target` e TTL vengono rilanciati: `/events/unblock` e `/events/reset-conflicts` rispondono 503 senza toccare il dispositivo, il Brain completa il ciclo e avvisa l'operatore che l'escalation è rimasta aperta.
 - **Provider gratuiti**: i modelli gratuiti hanno limiti di richieste e crediti; quando finiscono il grafo si ferma per l'operatore (comportamento voluto), oppure si abilita il ripiego in `configurazione.toml`.
 - **Observability**: solo log standard, nessuna metrica, trace o correlation ID. Nessun WebSocket (lo streaming è a Server-Sent Events).
+- **Lingue**: gli errori di validazione della configurazione e i log sono in italiano.
 - **Test ancora assenti**: concorrenza SQLite tra più processi, build Docker, carico.
 - **Override**: la traduzione della direttiva in comandi è affidata all'LLM; ogni comando passa comunque dall'elenco dei dispositivi ammessi e viene tracciato nell'audit log con `actor: "Brain_Override"`.
 
@@ -63,7 +69,7 @@ Le dipendenze sono fissate (2026-09-20):
 - Google: `GOOGLE_BASE_URL`, `GEMINI_API_KEY` o `GOOGLE_API_KEY`, `GEMINI_MODEL`.
 - Locale: `LOCAL_MODEL_BASE_URL`, `LOCAL_MODEL_DOCKER_BASE_URL`, `LOCAL_API_KEY`, `LOCAL_MODEL`.
 - OpenRouter: `OPENROUTER_BASE_URL`, `OPENROUTER_API_KEY`, `OPENROUTER_REFERER`, `OPENROUTER_APP_TITLE`, `OPENROUTER_MODEL`.
-- Prompt Brain: `BRAIN_SYSTEM_PROMPT`, `BRAIN_USER_PROMPT_TEMPLATE`.
+- Prompt del Brain, del troubleshooting, dell'override e del controllo macro: sezione `[prompt]` di `configurazione.toml` o variabili `PROMPT_*` del `.env` (il formato di risposta resta un contratto del codice).
 
 `.env.example` documenta queste variabili. Priorità, target, valori fisici dei device, frequenze e intervalli del loop restano in parte hardcoded o demandati all'implementazione del dominio.
 

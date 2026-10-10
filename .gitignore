@@ -35,3 +35,6 @@ Desktop.ini
 # SQLite in modalità WAL (checkpointer)
 *.db-wal
 *.db-shm
+
+# Copie di sicurezza create dall'editor delle impostazioni
+*.bak

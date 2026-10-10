@@ -15,17 +15,22 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 import asyncio
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Security
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
+from app.api.settings_routes import register_routes as register_settings_routes
 from app.agents.agent_registry import AgenteConFigliError, AgentRegistry, ErroreGerarchia
 from app.checkpointer import apri_checkpointer, chiudi_checkpointer, get_checkpointer, svuota_checkpoint
 from app.core.configurazione import get_configurazione
 from app.core.errori_llm import ErroreLLM, oscura_segreti
+from app.core.estensioni import carica_estensioni
+from app.core.lingua import scegli
+from app.core.pagine_web import INTESTAZIONI_PAGINA, risposta_pagina
 from app.core.modelli_agenti import (
     NOME_BRAIN, assicura_tabella as assicura_tabella_modelli, imposta_modello, leggi_modello, nome_canonico_brain,
     rimuovi_modello, risolvi_modello,
@@ -39,7 +44,9 @@ from app.graph.builder import build_graph
 from app.graph.hitl_config import NON_IMPOSTATO, HitlConfigSchema
 from app.graph.timer_hitl import GestoreTimerHitl, timer_attivo
 from app.MAO.model_access_object import PROVIDER_NOTI, Mao, normalizza_provider
-from app.tools.event_log import EventLog
+from app.tools.nervous_system import NervousSystem as EventLog  # nome storico: i vecchi test lo sostituiscono con patch
+from app.tools.statistiche_eventi import riassumi_eventi
+from app.tools.statistiche_grafo import riassumi_esecuzioni, riassumi_segnali
 
 # ---------------------------------------------------------------------------
 # Lifespan & Global State
@@ -72,7 +79,8 @@ _intestazione_chiave = APIKeyHeader(name="X-API-Key", auto_error=False)
 def _nega_per_ruolo(ruolo: Ruolo, richiesto: Ruolo) -> HTTPException:
     return HTTPException(
         status_code=403,
-        detail=f"Ruolo insufficiente: serve '{richiesto.nome}', la chiave usata è di '{ruolo.nome}'.",
+        detail=scegli(f"Ruolo insufficiente: serve '{richiesto.nome}', la chiave usata è di '{ruolo.nome}'.",
+                      f"Insufficient role: '{richiesto.etichetta('en')}' is required, the key used is '{ruolo.etichetta('en')}'."),
     )
 
 
@@ -100,7 +108,8 @@ async def autentica_e_autorizza(request: Request, chiave: str | None = Security(
     if ruolo is None:
         raise HTTPException(
             status_code=401,
-            detail="API key mancante o non valida: invia l'header X-API-Key.",
+            detail=scegli("API key mancante o non valida: invia l'header X-API-Key.",
+                          "Missing or invalid API key: send the X-API-Key header."),
             headers={"WWW-Authenticate": "ApiKey"},
         )
     request.state.ruolo = ruolo
@@ -120,14 +129,20 @@ async def lifespan(app: FastAPI):
     await apri_checkpointer()
     await _recompile_system_graph()
     sorveglianza_timer = asyncio.create_task(gestore_timer.sorveglia())
+    # Compiti in background dei nodi installati (es. lettura di una casella di posta, scadenze proprie).
+    compiti_estensioni = [asyncio.create_task(compito()) for e in carica_estensioni() for compito in e.compiti]
     try:
         yield
     finally:
-        sorveglianza_timer.cancel()
-        try:
-            await sorveglianza_timer
-        except asyncio.CancelledError:
-            pass
+        for compito in (sorveglianza_timer, *compiti_estensioni):
+            compito.cancel()
+            try:
+                await compito
+            except asyncio.CancelledError:
+                pass
+        for e in carica_estensioni():
+            for chiusura in e.chiusure:
+                await chiusura()
         await chiudi_checkpointer()
 
 
@@ -138,6 +153,12 @@ app = FastAPI(
     lifespan=lifespan,
     dependencies=[Depends(autentica_e_autorizza)],
 )
+
+register_settings_routes(app)
+for _estensione in carica_estensioni():  # rotte e pagine dei nodi installati (app/nodes)
+    if _estensione.registra_rotte:
+        _estensione.registra_rotte(app)
+
 
 @app.exception_handler(ErroreLLM)
 async def gestisci_errore_llm(request: Request, errore: ErroreLLM):
@@ -156,6 +177,9 @@ _THREAD_CONFIG = {"configurable": {"thread_id": _THREAD_ID}}
 class RunCycleRequest(BaseModel):
     """Payload per invocare un ciclo del grafo agenti."""
     sensor_readings: list[dict[str, Any]] = []
+    """Nome storico di `signals`."""
+    signals: list[dict[str, Any]] | None = None
+    """Segnali dei recettori (le letture dei sensori); se presente prevale su `sensor_readings`."""
     force_next_agent: str = "brain"
     thread_id: str | None = None
     """Identificatore di thread per la persistenza del grafo ed il resume HITL."""
@@ -269,19 +293,27 @@ class UnblockTargetRequest(BaseModel):
 
 
 _PAGINA_DEMO = Path(__file__).resolve().parent.parent / "static" / "demo_grafo.html"
-_INTESTAZIONI_PAGINA = {
-    # La pagina è autosufficiente: nessuna risorsa esterna, chiamate solo verso questa stessa API.
-    "Content-Security-Policy": "default-src 'none'; img-src data:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'",
-    "Cache-Control": "no-store",
-}
 
 
 @app.get("/demo", include_in_schema=False)
-async def pagina_demo():
+async def pagina_demo(request: Request):
     """Pagina dimostrativa che mostra il grafo in azione (si disattiva con `[demo] pagina_web = 0`)."""
     if not get_configurazione().demo_pagina_web or not _PAGINA_DEMO.is_file():
-        raise HTTPException(status_code=404, detail="Pagina dimostrativa non disponibile.")
-    return HTMLResponse(_PAGINA_DEMO.read_text(encoding="utf-8"), headers=_INTESTAZIONI_PAGINA)
+        raise HTTPException(status_code=404, detail=scegli("Pagina dimostrativa non disponibile.", "Demo page not available."))
+    return risposta_pagina(_PAGINA_DEMO, "demo", request, INTESTAZIONI_PAGINA)
+
+
+_PAGINA_CONFIG = Path(__file__).resolve().parent.parent / "static" / "config.html"
+
+
+async def pagina_config(request: Request):
+    """Form to edit .env, configurazione.toml and the files of the installed nodes (the files stay the main way); values come from the API."""
+    return risposta_pagina(_PAGINA_CONFIG, "config", request, INTESTAZIONI_PAGINA)
+
+
+# Plain Starlette route, outside the API key dependency (a browser cannot send the header to open a page); like the
+# other pages it holds no data: the values come from /config/api/*, which need the key.
+app.add_route("/config", pagina_config, methods=["GET"])
 
 
 @app.get("/")
@@ -298,16 +330,16 @@ async def run_graph_cycle(body: RunCycleRequest):
     config = {"configurable": {"thread_id": thread_id}}
     state = {
         "messages": [],
-        "readings": body.sensor_readings,
+        "readings": body.signals if body.signals is not None else body.sensor_readings,
         "recent_events": [],
         "pending_escalations": [],
         "next_agent": body.force_next_agent,
         "hitl_required": False,
-        "config": {"readings_window_hours": 4},
+        "config": {"signals_window_hours": get_configurazione().finestra_segnali_ore, "run_id": uuid4().hex[:12]},
     }
     graph = _graph
     if graph is None:
-        raise HTTPException(status_code=500, detail="Graph not available")
+        raise HTTPException(status_code=500, detail=scegli("Grafo non disponibile.", "Graph not available."))
     async with gestore_timer.blocco(thread_id):
         result = await graph.ainvoke(state, config=config)
     messages = result.get("messages", [])
@@ -382,10 +414,10 @@ _INTESTAZIONI_STREAM = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 async def run_graph_cycle_stream(body: RunCycleRequest):
     """Come POST /graph/run, ma risponde con un flusso di eventi (`text/event-stream`), uno per nodo eseguito."""
     if _graph is None:
-        raise HTTPException(status_code=500, detail="Graph not available")
+        raise HTTPException(status_code=500, detail=scegli("Grafo non disponibile.", "Graph not available."))
     ingresso = {
-        "messages": [], "readings": body.sensor_readings, "recent_events": [], "pending_escalations": [],
-        "next_agent": body.force_next_agent, "hitl_required": False, "config": {"readings_window_hours": 4},
+        "messages": [], "readings": body.signals if body.signals is not None else body.sensor_readings, "recent_events": [], "pending_escalations": [],
+        "next_agent": body.force_next_agent, "hitl_required": False, "config": {"signals_window_hours": get_configurazione().finestra_segnali_ore, "run_id": uuid4().hex[:12]},
     }
     return StreamingResponse(
         _flusso_grafo(ingresso, body.thread_id or _THREAD_ID), media_type="text/event-stream", headers=_INTESTAZIONI_STREAM,
@@ -399,12 +431,13 @@ async def resume_graph_stream(body: HitlResumeRequest, request: Request = None):
     if "OVERRIDE" in body.decision.upper():
         richiedi_ruolo(request, Ruolo.PRIMARIO)
     if _graph is None:
-        raise HTTPException(status_code=500, detail="Graph not available")
+        raise HTTPException(status_code=500, detail=scegli("Grafo non disponibile.", "Graph not available."))
     thread_id = body.thread_id or _THREAD_ID
     if (await gestore_timer._interrupt_corrente(thread_id))[0] is None:
         raise HTTPException(
             status_code=409,
-            detail="Nessuna richiesta HITL in attesa su questo thread (forse è già stata gestita o è scaduta).",
+            detail=scegli("Nessuna richiesta HITL in attesa su questo thread (forse è già stata gestita o è scaduta).",
+                          "No HITL request waiting on this thread (it may have been handled already or expired)."),
         )
     comando = Command(resume={"decision": body.decision, "reasoning": body.reasoning})
     return StreamingResponse(
@@ -421,7 +454,7 @@ async def get_graph_state(thread_id: str | None = None):
     config = {"configurable": {"thread_id": thread_id or _THREAD_ID}}
     graph = _graph
     if graph is None:
-        raise HTTPException(status_code=500, detail="Graph not available")
+        raise HTTPException(status_code=500, detail=scegli("Grafo non disponibile.", "Graph not available."))
     snapshot = await graph.aget_state(config)
     tasks = [
         {"id": t.id, "name": t.name, "interrupts": [str(i) for i in t.interrupts]}
@@ -451,12 +484,13 @@ async def resume_graph(body: HitlResumeRequest, request: Request = None):
     command = Command(resume={"decision": body.decision, "reasoning": body.reasoning})
     graph = _graph
     if graph is None:
-        raise HTTPException(status_code=500, detail="Graph not available")
+        raise HTTPException(status_code=500, detail=scegli("Grafo non disponibile.", "Graph not available."))
     async with gestore_timer.blocco(thread_id):
         if (await gestore_timer._interrupt_corrente(thread_id))[0] is None:
             raise HTTPException(
                 status_code=409,
-                detail="Nessuna richiesta HITL in attesa su questo thread (forse è già stata gestita o è scaduta).",
+                detail=scegli("Nessuna richiesta HITL in attesa su questo thread (forse è già stata gestita o è scaduta).",
+                          "No HITL request waiting on this thread (it may have been handled already or expired)."),
             )
         result = await graph.ainvoke(command, config=config)
     messages = result.get("messages", [])
@@ -539,16 +573,17 @@ async def create_sub_agent(body: CreateSubAgentRequest):
     try:
         raw = json.loads(body.agent_definition)
     except json.JSONDecodeError as e:
-        raise HTTPException(status_code=422, detail=f"agent_definition non è JSON valido: {e}")
+        raise HTTPException(status_code=422, detail=scegli(f"agent_definition non è JSON valido: {e}", f"agent_definition is not valid JSON: {e}"))
 
     # Normalizzazione campo nome ('name' oppure 'agent_name')
     name = raw.get("name") or raw.get("agent_name")
     if not name:
-        raise HTTPException(status_code=422, detail="Campo 'name' o 'agent_name' obbligatorio.")
+        raise HTTPException(status_code=422, detail=scegli("Campo 'name' o 'agent_name' obbligatorio.", "Field 'name' or 'agent_name' is required."))
 
     managed_targets = raw.get("managed_targets")
     if not managed_targets or not isinstance(managed_targets, list):
-        raise HTTPException(status_code=422, detail="Campo 'managed_targets' (lista non vuota) obbligatorio.")
+        raise HTTPException(status_code=422, detail=scegli("Campo 'managed_targets' (lista non vuota) obbligatorio.",
+                                                           "Field 'managed_targets' (a non-empty list) is required."))
 
     config = {
         "name": name,
@@ -596,7 +631,7 @@ async def delete_agent(agent_name: str):
     except AgenteConFigliError as e:
         raise HTTPException(status_code=409, detail=str(e))
     if not deleted:
-        raise HTTPException(status_code=404, detail=f"Agente '{agent_name}' non trovato.")
+        raise HTTPException(status_code=404, detail=scegli(f"Agente '{agent_name}' non trovato.", f"Agent '{agent_name}' not found."))
     await rimuovi_modello(agent_name)
     await _recompile_system_graph()
     return {"status": "deleted", "agent_name": agent_name}
@@ -608,16 +643,19 @@ async def _valida_provider_modello(provider: str | None, modello: str | None) ->
     """Provider noto e con chiave configurata (422 altrimenti); il modello è facoltativo."""
     nome = normalizza_provider(provider)
     if not nome:
-        raise HTTPException(status_code=422, detail="Il campo 'provider' è obbligatorio quando si indica un modello.")
+        raise HTTPException(status_code=422, detail=scegli("Il campo 'provider' è obbligatorio quando si indica un modello.",
+                                                           "Field 'provider' is required when a model is given."))
     if nome not in PROVIDER_NOTI:
-        raise HTTPException(status_code=422, detail=f"Provider '{provider}' sconosciuto: usa uno tra {list(PROVIDER_NOTI)}.")
+        raise HTTPException(status_code=422, detail=scegli(f"Provider '{provider}' sconosciuto: usa uno tra {list(PROVIDER_NOTI)}.",
+                                                           f"Unknown provider '{provider}': use one of {list(PROVIDER_NOTI)}."))
     mao = Mao()
     try:
         abilitato = mao.providers[nome]["enabled"]
     finally:
         await mao.aclose()
     if not abilitato:
-        raise HTTPException(status_code=422, detail=f"Il provider '{nome}' non ha una chiave API configurata nel file .env.")
+        raise HTTPException(status_code=422, detail=scegli(f"Il provider '{nome}' non ha una chiave API configurata nel file .env.",
+                                                           f"Provider '{nome}' has no API key configured in the .env file."))
     return nome, (modello or "").strip() or None
 
 
@@ -643,7 +681,7 @@ async def _agente_registrato(nome: str) -> str:
     for cfg in await registry.get_all_agent_configs():
         if cfg["name"].casefold() == nome.casefold():
             return cfg["name"]
-    raise HTTPException(status_code=404, detail=f"Agente '{nome}' non trovato.")
+    raise HTTPException(status_code=404, detail=scegli(f"Agente '{nome}' non trovato.", f"Agent '{nome}' not found."))
 
 
 async def _descrizione_modello_agente(nome: str) -> dict:
@@ -688,13 +726,16 @@ async def _get_or_create_tool(device_id: str):
     Restituisce il tool del dispositivo; se non esiste lo crea on-demand (stato OFF) nel registry condiviso,
     ma solo se il dispositivo è elencato in configurazione.toml (o la politica consente quelli non elencati).
     """
-    from app.tools.sensor_tools import get_tool as _get_tool
-    tool = _shared_tools.get(device_id)
+    from app.tools.effectors import get_tool as _get_tool, trova_tool
+    # Prima la mappa del grafo, poi il registry del processo (tool registrati dai moduli dei nodi installati):
+    # un tool registrato non viene mai sostituito da uno generico omonimo.
+    tool = trova_tool(device_id, _shared_tools)
     if not tool:
         if not get_configurazione().dispositivo_ammesso(device_id):
             raise HTTPException(
                 status_code=404,
-                detail=f"Il dispositivo '{device_id}' non è elencato in configurazione.toml: non viene creato.",
+                detail=scegli(f"Il dispositivo '{device_id}' non è elencato in configurazione.toml: non viene creato.",
+                              f"Device '{device_id}' is not listed in the configuration: it is not created."),
             )
         tool = _get_tool(device_id, initial_value="OFF", unit="")
         # Protegge la modifica della mappa condivisa
@@ -703,12 +744,14 @@ async def _get_or_create_tool(device_id: str):
     return tool
 
 
-@app.get("/tools", tags=["IoT Tools"])
+@app.get("/tools", include_in_schema=False)  # nome storico di /effectors
+@app.get("/effectors", tags=["Effectors"])
 async def list_tools():
-    """Elenca tutti i tool registrati e il loro valore corrente."""
+    """Elenca tutti i tool registrati (grafo e registry del processo) e il loro valore corrente."""
+    from app.tools.effectors import tool_registrati
     out = {}
     # Snapshot per evitare race con ricompilazione
-    tools_snapshot = dict(_shared_tools)
+    tools_snapshot = {**tool_registrati(), **_shared_tools}
     for name, tool in tools_snapshot.items():
         lettura = await leggi_tool(tool, name)
         out[name] = {"value": lettura.get("value"), "unit": getattr(tool, "unit", "")}
@@ -717,7 +760,8 @@ async def list_tools():
     return out
 
 
-@app.get("/tools/{device_id}", tags=["IoT Tools"])
+@app.get("/tools/{device_id}", include_in_schema=False)  # nome storico di /effectors/{device_id}
+@app.get("/effectors/{device_id}", tags=["Effectors"])
 async def get_tool_endpoint(device_id: str):
     """
     Legge il valore corrente di un tool. Se il dispositivo non è ancora registrato, viene creato on-demand con stato OFF.
@@ -730,7 +774,8 @@ async def get_tool_endpoint(device_id: str):
     return {"device_id": device_id, "value": lettura["value"], "unit": getattr(tool, "unit", "")}
 
 
-@app.post("/tools", tags=["IoT Tools"])
+@app.post("/tools", include_in_schema=False)  # nome storico di /effectors
+@app.post("/effectors", tags=["Effectors"])
 async def set_tool_endpoint(body: ToolWriteRequest):
     """
     Imposta direttamente il valore di un tool (bypass agenti). Crea il tool on-demand se non esiste.
@@ -748,12 +793,14 @@ async def set_tool_endpoint(body: ToolWriteRequest):
     return {"device_id": body.target, "new_value": lettura.get("value", validazione.valore)}
 
 
-@app.post("/tools/{device_id}/fault", tags=["IoT Tools"])
+@app.post("/tools/{device_id}/fault", include_in_schema=False)  # nome storico di /effectors/{device_id}/fault
+@app.post("/effectors/{device_id}/fault", tags=["Effectors"])
 async def set_tool_fault(device_id: str, body: ToolFaultRequest):
     """Simula (o rimuove) un guasto di un dispositivo mock, per provare troubleshooting ed escalation."""
     tool = await _get_or_create_tool(device_id)
     if not hasattr(tool, "imposta_guasto"):
-        raise HTTPException(status_code=400, detail=f"Il tool '{device_id}' non supporta la simulazione di guasti.")
+        raise HTTPException(status_code=400, detail=scegli(f"Il tool '{device_id}' non supporta la simulazione di guasti.",
+                                                           f"Tool '{device_id}' does not support fault simulation."))
     tool.imposta_guasto(body.fault, body.operations, body.commands_only)
     return {"device_id": device_id, "fault": tool.guasto, "operations": tool.guasti_residui, "commands_only": tool.guasto_solo_comandi}
 
@@ -766,6 +813,81 @@ async def get_events(window_minutes: int = 240):
     log = EventLog(target=["all"], frequency=window_minutes)
     events = await log.get_recent_events()
     return {"count": len(events), "events": events}
+
+
+@app.get("/events/stats", tags=["Database"])
+async def get_event_stats(window_hours: int = Query(24, ge=1, le=2160)):
+    """
+    Indicatori del sistema nervoso nella finestra: eventi per strato (Brain, organi, componenti, sistema), per esito
+    (azioni autonome, escalation, riconciliazioni, rifiuti, override…), per attore e dispositivo, nel tempo; tasso di
+    autonomia della periferia, escalation aperte, richieste HITL in attesa.
+    """
+    eventi = await EventLog(target=["all"], frequency=window_hours * 60).get_recent_events()
+    registrati = {a["name"]: a["level"] for a in await registry.get_all_agent_configs()}
+    esterni = {n: a.livello for n, a in get_configurazione().attori_esterni.items() if n not in registrati}
+    riassunto = riassumi_eventi(eventi, {**esterni, **registrati}, window_hours, esterni=set(esterni))
+    riassunto["agents"] = {"organs": sum(1 for l in registrati.values() if l <= 1),
+                           "components": sum(1 for l in registrati.values() if l >= 2),
+                           "external_organs": sum(1 for l in esterni.values() if l <= 1),
+                           "external_components": sum(1 for l in esterni.values() if l >= 2)}
+    in_attesa = False
+    if _graph is not None:
+        snapshot = await _graph.aget_state({"configurable": {"thread_id": _THREAD_ID}})
+        in_attesa = any(t.interrupts for t in snapshot.tasks)
+    riassunto["hitl"] = {"waiting": in_attesa, "with_timer": len(await gestore_timer.elenco())}
+    return riassunto
+
+
+@app.get("/graph/stats", tags=["Statistics"])
+async def get_graph_stats(window_hours: int = Query(24, ge=1, le=2160, description="runs started in the last hours")):
+    """
+    How the graph ran its nodes (Brain, organs, components) in the window: runs, outcomes and median/p90 duration per
+    node, transitions between nodes (`__start__` and `__end__` included), runs waiting for a person and how long the
+    resumed ones waited; plus the compiled topology (nodes and edges).
+    """
+    riassunto = riassumi_esecuzioni(await EventLog(target=["all"]).get_node_runs(window_hours), window_hours)
+    topologia: dict[str, Any] = {"nodes": [], "edges": []}
+    if _graph is not None:
+        grafo = _graph.get_graph()
+        topologia = {"nodes": sorted(n for n in grafo.nodes if not n.startswith("__")),
+                     "edges": [{"from": e.source, "to": e.target, "conditional": bool(e.conditional)} for e in grafo.edges]}
+    return {**riassunto, "topology": topologia}
+
+
+@app.get("/graph/runs", tags=["Statistics"])
+async def get_graph_runs(window_hours: int = Query(24, ge=1, le=2160), run_id: str | None = None,
+                         limit: int = Query(50, ge=1, le=500)):
+    """The runs of the window (newest first) with the steps each one went through; or one run by `run_id`."""
+    righe = await EventLog(target=["all"]).get_node_runs(window_hours, run_id=run_id)
+    per_run: dict[str, list[dict[str, Any]]] = {}
+    for riga in righe:
+        per_run.setdefault(riga["run_id"], []).append({k: riga[k] for k in ("node", "started_at", "duration_ms", "outcome", "detail")})
+    runs = [{"run_id": rid, "started_at": passi[0]["started_at"], "steps": passi, "waiting": passi[-1]["outcome"] == "waiting"}
+            for rid, passi in per_run.items()]
+    runs.sort(key=lambda r: r["started_at"], reverse=True)
+    return {"count": len(runs), "runs": runs[:limit]}
+
+
+@app.get("/signals", tags=["Statistics"])
+async def get_signals(window_hours: float = Query(4, gt=0, le=2160), receptor_id: str | None = None,
+                      limit: int = Query(500, ge=1, le=10000)):
+    """The numeric signals recorded by the receptors in the window (newest first), optionally of one receptor."""
+    righe = await EventLog(target=["all"]).get_recent_signals(window_hours, receptor_id)
+    return {"count": len(righe), "signals": righe[:limit]}
+
+
+@app.get("/signals/stats", tags=["Statistics"])
+async def get_signal_stats(window_hours: float = Query(24, gt=0, le=2160), receptor_id: str | None = None,
+                           agent_owner: str | None = None,
+                           bucket_minutes: float | None = Query(None, gt=0, description="size of the intervals of the series; default: the window in 48 intervals")):
+    """
+    Per receptor: count, min, max, mean, last value and a series over time (empty intervals stay with count 0).
+    Generic parameters: any receptor of any domain (temperature, heart rate, power...), filterable by receptor or owner agent.
+    """
+    righe = await EventLog(target=["all"]).get_recent_signals(window_hours, receptor_id)
+    if agent_owner:
+        righe = [r for r in righe if r.get("agent_owner") == agent_owner]
+    return riassumi_segnali(righe, window_hours, bucket_minutes)
 
 
 @app.post("/events/seed-conflict", tags=["Database"])
@@ -787,19 +909,35 @@ async def seed_conflict(body: SeedConflictRequest):
     return {"seeded": True, "event": body.model_dump()}
 
 
+def _database_non_disponibile(operazione_it: str, operazione_en: str, errore: Exception) -> HTTPException:
+    """503 quando il registro eventi non si può scrivere: niente esito positivo per un'operazione non avvenuta."""
+    return HTTPException(status_code=503, detail=scegli(
+        f"{operazione_it} non riuscito: il database degli eventi non è disponibile ({errore}). Nulla è stato modificato.",
+        f"{operazione_en} failed: the event database is not available ({errore}). Nothing was changed."))
+
+
 @app.delete("/events/reset-conflicts/{target}", tags=["Database"])
 async def reset_conflicts(target: str):
-    """Marca come risolti tutti gli eventi ESCALATION_PROPOSED per il target."""
+    """Marca come risolti tutti gli eventi ESCALATION_PROPOSED per il target (503 se il database non risponde)."""
     log = EventLog()
-    await log.mark_resolved(target)
-    return {"resolved": True, "target": target}
+    try:
+        chiuse = await log.mark_resolved(target)
+    except Exception as e:
+        raise _database_non_disponibile("Reset dei conflitti", "Conflict reset", e) from e
+    return {"resolved": True, "target": target, "count": chiuse}
 
 
 @app.post("/events/unblock", tags=["Database"])
 async def unblock_target_endpoint(body: UnblockTargetRequest):
-    """Sblocca un dispositivo in stato REJECTED/BLOCKED ripristinandolo a OFF/IDLE."""
+    """
+    Sblocca un dispositivo in stato REJECTED/BLOCKED ripristinandolo a OFF/IDLE. Se lo sblocco non si può registrare
+    (503) il dispositivo non viene toccato: resterebbe sbloccato fisicamente ma bloccato per gli agenti.
+    """
     log = EventLog()
-    await log.unblock_target(target=body.target, reasoning=body.reasoning)
+    try:
+        await log.unblock_target(target=body.target, reasoning=body.reasoning)
+    except Exception as e:
+        raise _database_non_disponibile("Sblocco", "Unblock", e) from e
     tool = _shared_tools.get(body.target)
     if tool:
         await tool.set_tool_value("OFF")
@@ -869,9 +1007,11 @@ async def reset_system_state():
     from app.db.database import DB_PATH
     from app.graph.hitl_config import hitl_manager
 
-    # 1. Svuota le tabelle SQLite (events, readings, agents_registry)
+    # 1. Svuota le tabelle SQLite (events, signals, agents_registry)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM events")
+        await db.execute("DELETE FROM signals")
+        await db.execute("DELETE FROM node_runs")
         await db.execute("DELETE FROM readings")
         await db.execute("DELETE FROM agents_registry")
         await db.commit()

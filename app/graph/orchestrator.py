@@ -8,11 +8,14 @@ from app.core.constants import is_control_flag
 from app.core.configurazione import get_configurazione
 from app.graph.hitl_config import e_decisione_sistema, flusso_brain_attivo, hitl_manager
 from app.core.errori_llm import ErroreLLM
+from app.core.lingua import scegli
+from app.core.prompt import compila_template, prompt_di_sistema
 from app.core.risultati import APPLICATO, e_comando_non_ammesso, e_guasto_tool
+from datetime import datetime, timezone
 from app.graph.state import GraphState
-from app.tools.baseTool import BaseTool
-from app.tools.sensor_tools import get_default_iot_tools, get_tool, tool_registrati
-from app.tools.tool_wrapper import force_execute_tool
+from app.tools.reflex import Reflex
+from app.tools.effectors import default_effectors, get_tool, tool_registrati
+from app.tools.motor_control import force_execute_tool
 
 logger = logging.getLogger(__name__)
 
@@ -72,27 +75,6 @@ def _normalize_action_value(target: str, action: str, explicit_value: Any = None
     return get_configurazione().valore_attivo(target, default="ON")
 
 
-# System prompt dedicato all'Arbitrato Semantico (Brain Override)
-_OVERRIDE_SYSTEM_PROMPT = (
-    "Sei il modulo di Arbitrato Semantico (Brain Override) di un sistema IoT N-Tier.\n"
-    "Il tuo compito è tradurre una direttiva umana complessa in un array JSON eseguibile.\n"
-    "L'utente può richiedere azioni multiple, come ignorare blocchi di sicurezza, accendere o spegnere dispositivi.\n\n"
-    "Checklist obbligatoria prima di generare ogni comando:\n"
-    "1. Identifica target e azione corretta.\n"
-    "2. Verifica i valori validi del device e usa solo quelli del catalogo.\n"
-    "3. Se l'azione è TURN_ON -> il valore fisico deve essere ON.\n"
-    "4. Se l'azione è TURN_OFF -> il valore fisico deve essere OFF.\n"
-    "5. Non usare nomi di azione come valori (es. FORCE_SHUTDOWN, TURN_ON, TURN_OFF).\n\n"
-    "REGOLE TASSATIVE:\n"
-    '1. Restituisci ESCLUSIVAMENTE un array JSON valido. Niente markdown, niente backticks (```json), nessuna parola di saluto.\n'
-    "2. Il formato di ogni oggetto deve essere esattamente:\n"
-    '   {{"target": "nome_del_dispositivo", "action": "UNBLOCK_AND_SET"|"TURN_OFF"|"TURN_ON", "value": "stringa o null"}}\n'
-    "3. Se l'utente chiede esplicitamente di ignorare un vincolo, sbloccare, o forzare un'accensione con un valore specifico, usa l'azione UNBLOCK_AND_SET.\n"
-    "4. Usa il catalogo dei valori validi del dispositivo e non inventare stati arbitrari.\n"
-    "Catalogo valori validi per i tool:\n"
-    "{tool_catalog}\n"
-)
-
 class BrainAgent(BaseAgent):
     """
     Orchestratore Supremo (Cervello / Padre).
@@ -101,7 +83,7 @@ class BrainAgent(BaseAgent):
 
     def __init__(
         self,
-        tools: list[BaseTool] | None = None,
+        tools: list[Reflex] | None = None,
         sub_agent_names: list[str] | None = None,
         registered_agent_names: list[str] | None = None,
     ):
@@ -112,9 +94,9 @@ class BrainAgent(BaseAgent):
             priority_weight=1000.0
         )
         if tools:
-            self.tools: dict[str, BaseTool] = {tool.target_device: tool for tool in tools}
+            self.tools: dict[str, Reflex] = {tool.target_device: tool for tool in tools}
         else:
-            self.tools = get_default_iot_tools()
+            self.tools = default_effectors()
         # Se il Brain viene usato direttamente, conserva il comportamento storico.
         # Il builder passa invece l'elenco effettivo (anche vuoto) dei nodi radice.
         self.sub_agent_names = list(sub_agent_names) if sub_agent_names is not None else ["agent_climate"]
@@ -124,36 +106,13 @@ class BrainAgent(BaseAgent):
             else list(self.sub_agent_names)
         )
 
-        # Prompt configurabili da .env
-        import os
         self.tool_value_catalog = _tool_value_catalog(self.tools)
-        self.system_prompt = (
-            os.getenv("BRAIN_SYSTEM_PROMPT")
-            or (
-                "Sei l'Orchestratore Supremo della Smart Home. "
-                "Hai ricevuto un'escalation da un sotto-agente per un conflitto o un'anomalia. "
-                "Hai visibilità su tutte le letture dei sensori delle ultime ore e sugli eventi recenti. "
-                "Compila una checklist: target, azione proposta, valore valido per device, decisione finale.\n"
-                "Catalogo valori validi per i device:\n"
-                f"{self.tool_value_catalog}\n"
-                "Valuta il contesto e decidi se APPROVARE o RESPINGERE l'azione.\n"
-                "Formato Risposta:\n"
-                "DECISIONE: [APPROVA|RESPINGI]\n"
-                "MOTIVAZIONE: [spiegazione]"
-            )
-        )
-        self.user_prompt_template = (
-            os.getenv("BRAIN_USER_PROMPT_TEMPLATE")
-            or (
-                "Agente Richiedente: {source}\n"
-                "Dispositivo Target: {target}\n"
-                "Azione Proposta: {action}\n"
-                "Motivo Escalation: {reason}\n"
-                "Letture Sensori Reali: {readings}\n"
-                "Storico Eventi Recenti: {recent_events}\n"
-                "Qual è la risoluzione corretta?"
-            )
-        )
+
+    @property
+    def system_prompt(self) -> str:
+        """Prompt dell'escalation in vigore (.env, configurazione.toml o default), con il catalogo dei valori."""
+        return prompt_di_sistema("brain_escalation", scegli("Catalogo valori validi per i device:", "Catalogue of valid values per device:")
+                                 + f"\n{self.tool_value_catalog}")
 
     async def process(self, 
         state: GraphState, recent_events: list[dict], relevant_readings: list[dict], agent_escalations: list[dict] ) -> dict[str, Any]:
@@ -175,14 +134,19 @@ class BrainAgent(BaseAgent):
                     "sensor_id": device_name,
                     "agent_owner": self.name,
                     "value": str(val),
-                    "unit": getattr(tool_obj, 'unit', '')
+                    "unit": getattr(tool_obj, 'unit', ''),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             except Exception as e:
                 logger.error(f"[{self.name}] Errore durante il readout del tool '{device_name}': {e}")
 
-        # Inserisce le letture fresche nello stato
+        # Inserisce i segnali freschi nello stato e, se numerici, nella tabella `signals` (storico oltre il run)
         if current_readings_map:
             updates["readings"] = list(current_readings_map.values())
+            try:
+                await self.event_log.record_signals(updates["readings"])
+            except Exception as e:
+                logger.error(f"[{self.name}] Segnali non salvati su DB (restano nello stato): {e}")
 
         pending_escalations = list(state.get("pending_escalations", []))
 
@@ -238,120 +202,56 @@ class BrainAgent(BaseAgent):
                 risolti = {e.get("id") for e in da_diagnosticare if e.get("id")}
                 pending_escalations = [e for e in pending_escalations if e.get("id") not in risolti]
 
+            # Fase 1 — decisioni umane. Tutte le richieste all'operatore (interrupt) vengono raccolte prima di qualsiasi
+            # effetto: alla ripresa LangGraph riesegue il nodo dall'inizio, e così non ripete né chiamate al modello né
+            # comandi ai dispositivi già fatti per le escalation precedenti.
+            casi: list[dict[str, Any]] = []
             for esc in pending_escalations:
                 if e_guasto_tool(esc.get("tool_result")):
-                    resolved_messages.extend(await self._richiedi_intervento_umano(esc))
+                    casi.append({"esc": esc, "tipo": "guasto", "intervento": self._chiedi_intervento_umano(esc)})
                     continue
-
-                source = esc.get("source_agent")
+                caso: dict[str, Any] = {"esc": esc, "tipo": "decisione", "risposta": None}
                 target = esc.get("target_device")
-                action = esc.get("proposed_action")
-                reason = esc.get("reason")
-
-                system_prompt = self.system_prompt
-                user_prompt = self.user_prompt_template.format(
-                    source=source,
-                    target=target,
-                    action=action,
-                    reason=reason,
-                    readings=current_readings_map.get(target, {}),
-                    recent_events=recent_events,
-                )
-
                 # Flusso HITL "brain": [hitl] livello in configurazione.toml
-                use_hitl = flusso_brain_attivo() and self._richiede_approvazione_umana(state, target)
-
-                if use_hitl:
-                    logger.warning(f"[{self.name}] HITL ATTIVO — Invocazione interrupt(). Grafo in PAUSA per target '{target}' ({action})...")
-                    from langgraph.types import interrupt
-                    human_payload = interrupt({
-                        "type": "escalation_approval_request",
-                        "target_device": target,
-                        "proposed_action": action,
-                        "source_agent": source,
-                        "reason": reason,
-                        "prompt": f"Approvazione Umana Richiesta per '{target}': l'agente '{source}' propone '{action}'. Motivo: {reason}."
-                    })
-
-                    if isinstance(human_payload, dict):
-                        decision_val = str(human_payload.get("decision", "RESPINGI")).upper()
-                        decision_reason = human_payload.get("reasoning", "Decisione fornita dall'utente via HITL API")
-                    else:
-                        decision_val = str(human_payload).upper()
-                        decision_reason = "Decisione fornita dall'utente via HITL API"
-
-                    # --- PERCORSO OVERRIDE: Arbitrato Semantico MAO → JSON → force_execute_tool ---
+                if flusso_brain_attivo() and self._richiede_approvazione_umana(state, target):
+                    decision_val, decision_reason = self._chiedi_approvazione(esc)
                     if "OVERRIDE" in decision_val:
                         logger.warning(f"[{self.name}] OVERRIDE ricevuto. Avvio Arbitrato Semantico per: '{decision_reason}'")
-                        override_msgs = await self._execute_semantic_override(
-                            human_directive=decision_reason,
-                            fallback_target=target,
-                            fallback_action=action,
-                        )
-                        resolved_messages.extend(override_msgs)
-                        # non serve continuare con la logica standard
-                        continue
-
-                    if e_decisione_sistema(decision_val):
+                        caso.update(tipo="override", direttiva=decision_reason)
+                    elif e_decisione_sistema(decision_val):
                         # Timer scaduto con azione "sistema": decide il Brain con il suo modello, come senza HITL.
                         logger.warning(f"[{self.name}] Nessuna risposta dell'operatore per '{target}': decide il sistema.")
-                        decision_response = await self.ask_brain(system_prompt, user_prompt, temperature=0.0, max_tokens=2048)
                     elif "APPROVA" in decision_val or "APPROVE" in decision_val or "YES" in decision_val:
-                        decision_response = f"DECISIONE: APPROVA\nMOTIVAZIONE: {decision_reason}"
+                        caso["risposta"] = f"DECISIONE: APPROVA\nMOTIVAZIONE: {decision_reason}"
                     else:
-                        decision_response = f"DECISIONE: RESPINGI\nMOTIVAZIONE: {decision_reason}"
-                else:
-                    decision_response = await self.ask_brain(system_prompt, user_prompt, temperature=0.0, max_tokens=2048)
+                        caso["risposta"] = f"DECISIONE: RESPINGI\nMOTIVAZIONE: {decision_reason}"
+                casi.append(caso)
 
-                logger.info(f"[{self.name}] Risoluzione (AI/HITL) per {target}: {decision_response}")
+            # Fase 2 — una sola chiamata al modello per tutte le escalation che il Brain decide da sé. Ogni decisione
+            # viene letta prima di agire: una risposta incompleta non comanda nessun dispositivo e ferma il grafo.
+            da_decidere = [c for c in casi if c["tipo"] == "decisione" and c["risposta"] is None]
+            if da_decidere:
+                await self._decidi_escalation(da_decidere, current_readings_map, recent_events)
+            for c in casi:
+                if c["tipo"] == "decisione":
+                    c["decisione"] = self.estrai_decisione(c["risposta"], ("APPROVA", "RESPINGI"))
+                    if c["decisione"] is None:
+                        # Una risposta senza decisione non equivale a un rifiuto: si ferma il grafo per l'operatore.
+                        raise self.decisione_non_riconosciuta(c["risposta"])
 
-                decisione = self.estrai_decisione(decision_response, ("APPROVA", "RESPINGI"))
-                if decisione is None:
-                    # Una risposta senza decisione non equivale a un rifiuto: si ferma il grafo per l'operatore.
-                    raise self.decisione_non_riconosciuta(decision_response)
-                if decisione == "APPROVA":
-                    risultato = await self.applica_stato(
-                        target=target,
-                        action=f"RECONCILED_{action}",
-                        new_value=action,   # action è già il valore canonico (es. "22.5°C")
-                        reasoning=f"Approvato da Orchestratore Padre. Detail: {decision_response}",
-                        escalated=False,
-                        tools_map=self.tools
-                    )
-                    if e_comando_non_ammesso(risultato):
-                        # L'approvazione riguarda la riconciliazione: il valore proposto non è un comando ammesso, il dispositivo non cambia.
-                        await self.event_log.mark_resolved(target)
-                        resolved_messages.append(
-                            f"[{self.name}] Escalation APPROVATA per {target} ma NON APPLICATA: {risultato['response']}"
-                        )
-                        continue
-                    if e_guasto_tool(risultato):
-                        # L'approvazione non basta: il dispositivo è guasto. Si passa alla richiesta di intervento umano.
-                        guasti_da_escalare.append(self.create_escalation(
-                            target_device=target,
-                            proposed_action=action,
-                            reason=f"Guasto del dispositivo '{target}' durante l'attuazione approvata: {risultato['response']}",
-                            conflict_detected=True,
-                            tool_result=risultato,
-                        ))
-                        resolved_messages.append(
-                            f"[{self.name}] Escalation APPROVATA per {target} ma il dispositivo è guasto: {risultato['response']}"
-                        )
-                        continue
-                    await self.event_log.mark_resolved(target)
-                    status_text = "APPLICATA" if risultato["status"] == APPLICATO else "SALTATA (già a regime)"
-                    resolved_messages.append(f"[{self.name}] Escalation APPROVATA [{status_text}] per {target} ({action}).")
+            # Fase 3 — esecuzione, nell'ordine delle escalation.
+            for c in casi:
+                esc = c["esc"]
+                if c["tipo"] == "guasto":
+                    resolved_messages.extend(await self._esegui_intervento_umano(esc, *c["intervento"]))
+                elif c["tipo"] == "override":
+                    resolved_messages.extend(await self._execute_semantic_override(
+                        human_directive=c["direttiva"],
+                        fallback_target=esc.get("target_device"),
+                        fallback_action=esc.get("proposed_action"),
+                    ))
                 else:
-                    await self.apply_status(
-                        target=target,
-                        action=f"REJECTED_{action}",
-                        new_value="REJECTED",
-                        reasoning=f"Respinto da Orchestratore Padre. Detail: {decision_response}",
-                        escalated=False,
-                        tools_map=self.tools
-                    )
-                    await self.event_log.mark_resolved(target)
-                    resolved_messages.append(f"[{self.name}] Escalation RESPINTA per {target} su richiesta di {source}.")
+                    await self._applica_decisione(esc, c["decisione"], c["risposta"], resolved_messages, guasti_da_escalare)
 
             updates["messages"] = [AIMessage(content="\n".join(resolved_messages))]
             if guasti_da_escalare:
@@ -393,6 +293,129 @@ class BrainAgent(BaseAgent):
 
         return updates
 
+    def _chiedi_approvazione(self, esc: dict[str, Any]) -> tuple[str, str]:
+        """Interrupt di approvazione di un'escalation: restituisce (decisione in maiuscolo, motivazione dell'operatore)."""
+        from langgraph.types import interrupt
+
+        target, action = esc.get("target_device"), esc.get("proposed_action")
+        source, reason = esc.get("source_agent"), esc.get("reason")
+        logger.warning(f"[{self.name}] HITL ATTIVO — Invocazione interrupt(). Grafo in PAUSA per target '{target}' ({action})...")
+        human_payload = interrupt({
+            "type": "escalation_approval_request",
+            "target_device": target,
+            "proposed_action": action,
+            "source_agent": source,
+            "reason": reason,
+            "prompt": scegli(f"Approvazione Umana Richiesta per '{target}': l'agente '{source}' propone '{action}'. Motivo: {reason}.",
+                             f"Human approval required for '{target}': agent '{source}' proposes '{action}'. Reason: {reason}.")
+        })
+        if isinstance(human_payload, dict):
+            return (str(human_payload.get("decision", "RESPINGI")).upper(),
+                    human_payload.get("reasoning", "Decisione fornita dall'utente via HITL API"))
+        return str(human_payload).upper(), "Decisione fornita dall'utente via HITL API"
+
+    async def _decidi_escalation(self, casi: list[dict[str, Any]], letture: dict[str, Any], recent_events: list[dict]) -> None:
+        """
+        Una sola chiamata al modello per tutte le escalation da decidere; scrive in ogni caso la sua parte di risposta
+        (`risposta`). Con un'escalation il formato è quello di sempre; con più escalation ognuna è numerata e il
+        modello risponde con un blocco per escalation (`ESCALATION: <numero>` seguito da DECISIONE e MOTIVAZIONE).
+        """
+        def blocco(esc: dict[str, Any], eventi: Any) -> str:
+            return compila_template(
+                "brain_escalation_utente",
+                source=esc.get("source_agent"),
+                target=esc.get("target_device"),
+                action=esc.get("proposed_action"),
+                reason=esc.get("reason"),
+                readings=letture.get(esc.get("target_device"), {}),
+                recent_events=eventi,
+            )
+
+        if len(casi) == 1:
+            risposta = await self.ask_brain(self.system_prompt, blocco(casi[0]["esc"], recent_events),
+                                            temperature=0.0, max_tokens=2048)
+            logger.info(f"[{self.name}] Risoluzione (AI) per {casi[0]['esc'].get('target_device')}: {risposta}")
+            casi[0]["risposta"] = risposta
+            return
+
+        # Lo storico degli eventi è lo stesso per tutte: compare una volta sola, in fondo.
+        vedi_sotto = scegli("(vedi lo storico in fondo)", "(see the history at the end)")
+        parti = [f"ESCALATION: {i}\n{blocco(c['esc'], vedi_sotto)}" for i, c in enumerate(casi, start=1)]
+        parti.append(scegli("Storico eventi recenti: ", "Recent events: ") + str(recent_events))
+        formato = scegli(
+            f"Ricevi {len(casi)} escalation numerate. Decidi OGNUNA separatamente: rispondi con un blocco per escalation, "
+            "che inizia con la riga `ESCALATION: <numero>` e prosegue con il formato di risposta indicato sopra.",
+            f"You receive {len(casi)} numbered escalations. Decide EACH one separately: answer with one block per "
+            "escalation, starting with the line `ESCALATION: <number>` and going on with the answer format given above.")
+        risposta = await self.ask_brain(f"{self.system_prompt}\n\n{formato}", "\n\n".join(parti),
+                                        temperature=0.0, max_tokens=2048)
+        logger.info(f"[{self.name}] Risoluzione (AI) di {len(casi)} escalation in una chiamata: {risposta}")
+        blocchi = self.dividi_in_blocchi(risposta, "ESCALATION", [str(i) for i in range(1, len(casi) + 1)])
+        for i, c in enumerate(casi, start=1):
+            c["risposta"] = blocchi.get(str(i), "")
+
+    async def _applica_decisione(self, esc: dict[str, Any], decisione: str, decision_response: str,
+                                 resolved_messages: list[str], guasti_da_escalare: list[dict[str, Any]]) -> None:
+        """Esegue la decisione (APPROVA o RESPINGI) su un'escalation e ne scrive l'esito nei messaggi."""
+        source, target, action = esc.get("source_agent"), esc.get("target_device"), esc.get("proposed_action")
+        if decisione == "APPROVA":
+            risultato = await self.applica_stato(
+                target=target,
+                action=f"RECONCILED_{action}",
+                new_value=action,   # action è già il valore canonico (es. "22.5°C")
+                reasoning=f"Approvato da Orchestratore Padre. Detail: {decision_response}",
+                escalated=False,
+                tools_map=self.tools
+            )
+            if e_comando_non_ammesso(risultato):
+                # L'approvazione riguarda la riconciliazione: il valore proposto non è un comando ammesso, il dispositivo non cambia.
+                await self._chiudi_escalation(target, resolved_messages)
+                resolved_messages.append(
+                    f"[{self.name}] Escalation APPROVATA per {target} ma NON APPLICATA: {risultato['response']}"
+                )
+                return
+            if e_guasto_tool(risultato):
+                # L'approvazione non basta: il dispositivo è guasto. Si passa alla richiesta di intervento umano.
+                guasti_da_escalare.append(self.create_escalation(
+                    target_device=target,
+                    proposed_action=action,
+                    reason=f"Guasto del dispositivo '{target}' durante l'attuazione approvata: {risultato['response']}",
+                    conflict_detected=True,
+                    tool_result=risultato,
+                ))
+                resolved_messages.append(
+                    f"[{self.name}] Escalation APPROVATA per {target} ma il dispositivo è guasto: {risultato['response']}"
+                )
+                return
+            await self._chiudi_escalation(target, resolved_messages)
+            status_text = "APPLICATA" if risultato["status"] == APPLICATO else "SALTATA (già a regime)"
+            resolved_messages.append(f"[{self.name}] Escalation APPROVATA [{status_text}] per {target} ({action}).")
+        else:
+            await self.apply_status(
+                target=target,
+                action=f"REJECTED_{action}",
+                new_value="REJECTED",
+                reasoning=f"Respinto da Orchestratore Padre. Detail: {decision_response}",
+                escalated=False,
+                tools_map=self.tools
+            )
+            await self._chiudi_escalation(target, resolved_messages)
+            resolved_messages.append(f"[{self.name}] Escalation RESPINTA per {target} su richiesta di {source}.")
+
+    async def _chiudi_escalation(self, target: str, messaggi: list[str]) -> None:
+        """
+        Chiude le escalation del target dopo la decisione. Se il database non risponde la decisione resta valida (il
+        dispositivo è già stato comandato): il ciclo prosegue e il messaggio avvisa l'operatore che l'escalation è
+        rimasta aperta e verrà riproposta al prossimo ciclo.
+        """
+        try:
+            await self.event_log.mark_resolved(target)
+        except Exception as e:
+            logger.error(f"[{self.name}] Escalation di '{target}' non chiusa: database degli eventi non disponibile ({e}).")
+            messaggi.append(scegli(
+                f"[{self.name}] ATTENZIONE: escalation di '{target}' decisa ma non chiusa nel database ({e}): verrà riproposta al prossimo ciclo.",
+                f"[{self.name}] WARNING: escalation of '{target}' decided but not closed in the database ({e}): it will come back at the next cycle."))
+
     def _richiede_approvazione_umana(self, state: GraphState, target: str | None) -> bool:
         """
         Flusso HITL "brain": il Brain chiede all'operatore prima di valutare un'escalation se la richiesta è marcata come
@@ -410,10 +433,15 @@ class BrainAgent(BaseAgent):
         )
 
     async def _richiedi_intervento_umano(self, escalation: dict[str, Any]) -> list[str]:
+        """Richiesta all'operatore per un guasto non risolto ed esecuzione della sua decisione (vedi le due parti)."""
+        return await self._esegui_intervento_umano(escalation, *self._chiedi_intervento_umano(escalation))
+
+    def _chiedi_intervento_umano(self, escalation: dict[str, Any]) -> tuple[str, str, str]:
         """
         Ultima istanza per un guasto che il troubleshooting non ha risolto: mette il grafo in pausa (interrupt) con
         l'esito strutturato e la diagnosi. Con OVERRIDE l'operatore può impartire una direttiva in linguaggio naturale;
-        qualsiasi altra decisione prende atto del guasto e chiude l'escalation.
+        qualsiasi altra decisione prende atto del guasto e chiude l'escalation. Restituisce (dispositivo, decisione,
+        motivo) senza effetti: l'esecuzione è in `_esegui_intervento_umano`.
         """
         from langgraph.types import interrupt
 
@@ -428,9 +456,11 @@ class BrainAgent(BaseAgent):
             "source_agent": escalation.get("source_agent"),
             "tool_result": tool_result,
             "diagnosis": diagnosi,
-            "prompt": (
+            "prompt": scegli(
                 f"Intervento umano richiesto: il dispositivo '{device}' non risponde ({tool_result.get('response')}). "
-                f"Diagnosi: {diagnosi}. Decisioni: OVERRIDE (direttiva nel campo reasoning) oppure altro per prendere atto."
+                f"Diagnosi: {diagnosi}. Decisioni: OVERRIDE (direttiva nel campo reasoning) oppure altro per prendere atto.",
+                f"Human intervention required: device '{device}' does not respond ({tool_result.get('response')}). "
+                f"Diagnosis: {diagnosi}. Decisions: OVERRIDE (directive in the reasoning field) or anything else to acknowledge.",
             ),
         })
         decisione = "APPROVA"
@@ -441,6 +471,11 @@ class BrainAgent(BaseAgent):
         elif risposta:
             decisione = str(risposta).upper()
 
+        return device, decisione, motivo
+
+    async def _esegui_intervento_umano(self, escalation: dict[str, Any], device: str, decisione: str,
+                                       motivo: str) -> list[str]:
+        """Esegue la decisione dell'operatore su un guasto: override, presa d'atto o scadenza del timer."""
         messaggi: list[str] = []
         if e_decisione_sistema(decisione):
             motivo = f"nessun operatore ha risposto entro il timer: guasto non risolto, registrato senza altre azioni ({motivo})"
@@ -473,19 +508,27 @@ class BrainAgent(BaseAgent):
         """
         # Il Brain vede anche i tool creati on-demand dopo la sua costruzione (es. via API), non solo la sua copia.
         tool_visibili = {**tool_registrati(), **self.tools}
-        override_prompt = (
+        catalogo = _tool_value_catalog(tool_visibili)
+        override_prompt = scegli(
             f"Direttiva umana da tradurre:\n\"{human_directive}\"\n\n"
             f"Contesto: i dispositivi disponibili nel sistema includono {list(tool_visibili.keys())}.\n"
-            f"Catalogo valori validi:\n{_tool_value_catalog(tool_visibili)}\n\n"
+            f"Catalogo valori validi:\n{catalogo}\n\n"
             "Checklist: target corretto, azione corretta, valore valido per il device, e mai usare il nome dell'azione come stato.\n"
             "Se la direttiva non specifica un dispositivo riconoscibile, usa il dispositivo di fallback: "
-            f"\"{fallback_target}\" con azione \"{fallback_action}\"."
+            f"\"{fallback_target}\" con azione \"{fallback_action}\".",
+            f"Human directive to translate:\n\"{human_directive}\"\n\n"
+            f"Context: the devices available in the system include {list(tool_visibili.keys())}.\n"
+            f"Catalogue of valid values:\n{catalogo}\n\n"
+            "Checklist: right target, right action, valid value for the device, and never an action name as a state.\n"
+            "If the directive names no recognisable device, use the fallback device: "
+            f"\"{fallback_target}\" with action \"{fallback_action}\".",
         )
 
         raw_response = ""
         try:
             raw_response = await self.ask_brain(
-                _OVERRIDE_SYSTEM_PROMPT.format(tool_catalog=_tool_value_catalog(tool_visibili)),
+                prompt_di_sistema("override", scegli("Catalogo valori validi per i tool:", "Catalogue of valid values per tool:")
+                                  + f"\n{catalogo}"),
                 override_prompt,
                 temperature=0.0,
                 max_tokens=1024,
@@ -589,19 +632,11 @@ class BrainAgent(BaseAgent):
                 "messages": [AIMessage(content=f"[{self.name}] Macro Check Completato: {macro_response}")]
             }
 
-        system_prompt = (
-            "Sei l'Orchestratore Supremo. Stai eseguendo il controllo di routine dello stato globale della casa. "
-            "Esamina le letture reali e gli eventi recenti. "
-            "Se trovi inefficienze macro, indica l'azione da intraprendere.\n"
-            "Formato Risposta:\n"
-            "STATUS: [OK|MACRO_ADJUSTMENT_REQUIRED]\n"
-            "DETTAGLI: [spiegazione]"
-        )
+        system_prompt = prompt_di_sistema("controllo_macro")
 
-        user_prompt = (
-            f"Letture reali: {relevant_readings}\n"
-            f"Eventi recenti: {recent_events}\n"
-            "Valuta la situazione macro dell'abitazione."
+        user_prompt = scegli(
+            f"Letture reali: {relevant_readings}\nEventi recenti: {recent_events}\nValuta la situazione macro del sistema.",
+            f"Real readings: {relevant_readings}\nRecent events: {recent_events}\nAssess the overall state of the system.",
         )
 
         macro_response = await self.ask_brain(system_prompt, user_prompt, temperature=0.1, max_tokens=2048)

@@ -25,17 +25,27 @@ class Ruolo(IntEnum):
     def nome(self) -> str:
         return self.name.lower()
 
+    @property
+    def nome_inglese(self) -> str:
+        return {1: "viewer", 2: "operator", 3: "admin"}[self.value]
+
+    def etichetta(self, lingua: str = "it") -> str:
+        """Il nome da mostrare: 'operator (medico_di_guardia)' in inglese, 'medico_di_guardia' in italiano."""
+        return f"{self.nome_inglese} ({self.nome})" if lingua == "en" else self.nome
+
 
 # Variabili d'ambiente che contengono la chiave di ciascun ruolo. `API_KEY` è la chiave unica storica: vale come primario.
+# I nomi inglesi (API_KEY_ADMIN, API_KEY_OPERATOR, API_KEY_VIEWER) valgono quanto quelli italiani.
 VARIABILI_CHIAVE: dict[Ruolo, tuple[str, ...]] = {
-    Ruolo.PRIMARIO: ("API_KEY_PRIMARIO", "API_KEY"),
-    Ruolo.MEDICO_DI_GUARDIA: ("API_KEY_MEDICO_DI_GUARDIA",),
-    Ruolo.TIROCINANTE: ("API_KEY_TIROCINANTE",),
+    Ruolo.PRIMARIO: ("API_KEY_PRIMARIO", "API_KEY_ADMIN", "API_KEY"),
+    Ruolo.MEDICO_DI_GUARDIA: ("API_KEY_MEDICO_DI_GUARDIA", "API_KEY_OPERATOR"),
+    Ruolo.TIROCINANTE: ("API_KEY_TIROCINANTE", "API_KEY_VIEWER"),
 }
 
-ROTTE_PUBBLICHE = {("GET", "/"), ("GET", "/demo")}
+ROTTE_PUBBLICHE = {("GET", "/"), ("GET", "/demo")}  # le estensioni (app/core/estensioni.py) aggiungono le proprie pagine
 
 # Ruolo minimo per ogni endpoint (metodo, percorso). Un endpoint non elencato richiede il ruolo massimo.
+# Le estensioni aggiungono le voci delle proprie rotte quando vengono caricate.
 PERMESSI: dict[tuple[str, str], Ruolo] = {
     # Osservazione
     ("GET", "/graph/state"): Ruolo.TIROCINANTE,
@@ -45,8 +55,16 @@ PERMESSI: dict[tuple[str, str], Ruolo] = {
     ("GET", "/agents/hierarchy"): Ruolo.TIROCINANTE,
     ("GET", "/agents/{agent_name}/model"): Ruolo.TIROCINANTE,
     ("GET", "/tools"): Ruolo.TIROCINANTE,
+    ("GET", "/effectors"): Ruolo.TIROCINANTE,
     ("GET", "/tools/{device_id}"): Ruolo.TIROCINANTE,
+    ("GET", "/effectors/{device_id}"): Ruolo.TIROCINANTE,
     ("GET", "/events"): Ruolo.TIROCINANTE,
+    ("GET", "/events/stats"): Ruolo.TIROCINANTE,
+    ("GET", "/graph/stats"): Ruolo.TIROCINANTE,
+    ("GET", "/graph/runs"): Ruolo.TIROCINANTE,
+    ("GET", "/signals"): Ruolo.TIROCINANTE,
+    ("GET", "/signals/stats"): Ruolo.TIROCINANTE,
+    ("GET", "/config/api/fields"): Ruolo.TIROCINANTE,  # values only: secrets are never returned
     # Procedure ordinarie (/graph/resume con OVERRIDE richiede comunque il primario)
     ("POST", "/graph/run"): Ruolo.MEDICO_DI_GUARDIA,
     ("POST", "/graph/resume"): Ruolo.MEDICO_DI_GUARDIA,
@@ -54,15 +72,20 @@ PERMESSI: dict[tuple[str, str], Ruolo] = {
     ("POST", "/graph/resume/stream"): Ruolo.MEDICO_DI_GUARDIA,
     ("POST", "/graph/health-check"): Ruolo.MEDICO_DI_GUARDIA,
     ("POST", "/tools"): Ruolo.MEDICO_DI_GUARDIA,
+    ("POST", "/effectors"): Ruolo.MEDICO_DI_GUARDIA,
     ("POST", "/events/unblock"): Ruolo.MEDICO_DI_GUARDIA,
     ("DELETE", "/events/reset-conflicts/{target}"): Ruolo.MEDICO_DI_GUARDIA,
     # Decisioni critiche e configurazione
     ("POST", "/hitl/config"): Ruolo.PRIMARIO,
+    ("POST", "/config/api/save"): Ruolo.PRIMARIO,  # writes .env and the TOML files
+    ("POST", "/config/api/restore"): Ruolo.PRIMARIO,
+    ("POST", "/config/api/restart"): Ruolo.PRIMARIO,  # stops the process and starts it again
     ("POST", "/agents/create"): Ruolo.PRIMARIO,
     ("DELETE", "/agents/{agent_name}"): Ruolo.PRIMARIO,
     ("PUT", "/agents/{agent_name}/model"): Ruolo.PRIMARIO,
     ("DELETE", "/agents/{agent_name}/model"): Ruolo.PRIMARIO,
     ("POST", "/tools/{device_id}/fault"): Ruolo.PRIMARIO,
+    ("POST", "/effectors/{device_id}/fault"): Ruolo.PRIMARIO,
     ("POST", "/events/seed-conflict"): Ruolo.PRIMARIO,
     ("POST", "/llm/invoke"): Ruolo.PRIMARIO,
     ("DELETE", "/system/reset"): Ruolo.PRIMARIO,

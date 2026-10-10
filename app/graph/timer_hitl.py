@@ -14,6 +14,10 @@ Alla scadenza applica l'azione scelta in configurazione ([hitl] azione_alla_scad
 
 La durata è `max_wait_seconds` di POST /hitl/config se impostato, altrimenti `timer_predefinito_secondi`.
 Le scadenze sono su SQLite, quindi sopravvivono ai riavvii insieme agli interrupt del checkpointer.
+
+Lo stesso gestore serve anche altri grafi (per esempio quello di un nodo installato): a chi lo crea basta passare il
+grafo, il database, e se servono regole proprie quando il timer è attivo, quanto dura, che cosa fa alla scadenza e
+per quali tipi di interrupt vale.
 """
 
 import asyncio
@@ -73,10 +77,17 @@ def _iso(epoca: float) -> str:
 
 
 class GestoreTimerHitl:
-    def __init__(self, ottieni_grafo: Callable[[], Any], db_path: str = DB_PATH, orologio: Callable[[], float] = time.time):
+    def __init__(self, ottieni_grafo: Callable[[], Any], db_path: str = DB_PATH, orologio: Callable[[], float] = time.time,
+                 attivo: Callable[[], bool] = timer_attivo, durata: Callable[[], int | None] = durata_timer_secondi,
+                 azione: Callable[[], str] | None = None, tipi: frozenset[str] | None = None):
+        """`tipi`: i tipi di interrupt (campo "type" del payload) con il timer; None: tutti."""
         self._ottieni_grafo = ottieni_grafo
         self.db_path = db_path
         self._orologio = orologio
+        self._attivo = attivo
+        self._durata = durata
+        self._azione = azione or (lambda: get_configurazione().hitl_azione_alla_scadenza)
+        self._tipi = tipi
         self._blocchi: dict[str, asyncio.Lock] = {}
 
     def blocco(self, thread_id: str) -> asyncio.Lock:
@@ -127,13 +138,14 @@ class GestoreTimerHitl:
         if interrupt_id is None:
             await self._elimina(thread_id)
             return self._stato(None, in_pausa=False)
-        if not timer_attivo():
+        if not self._attivo() or (self._tipi is not None and tipo not in self._tipi):
+            await self._elimina(thread_id)
             return self._stato(None, in_pausa=True, tipo=tipo)
 
         riga = await self._riga(thread_id)
         if riga is None or riga[0] != interrupt_id:
             ora = self._orologio()
-            durata = durata_timer_secondi()
+            durata = self._durata()
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute(
                     """INSERT OR REPLACE INTO hitl_scadenze (thread_id, interrupt_id, tipo, creato_il, scade_il, durata_secondi, stato)
@@ -154,10 +166,10 @@ class GestoreTimerHitl:
 
     def _stato(self, riga, in_pausa: bool, tipo: str | None = None) -> dict[str, Any]:
         stato: dict[str, Any] = {
-            "attivo": timer_attivo(),
+            "attivo": self._attivo(),
             "in_pausa": in_pausa,
             "tipo": tipo,
-            "azione_alla_scadenza": get_configurazione().hitl_azione_alla_scadenza,
+            "azione_alla_scadenza": self._azione(),
         }
         if riga is None:
             stato.update(secondi_totali=None, secondi_rimanenti=None, scade_il=None, scaduto=False)
@@ -197,8 +209,7 @@ class GestoreTimerHitl:
         Applica l'azione di scadenza alle richieste il cui timer è finito. Restituisce i thread ripresi dal sistema
         (respinti o lasciati decidere al Brain). Se nel frattempo l'operatore ha già risposto non fa nulla.
         """
-        configurazione = get_configurazione()
-        if not configurazione.hitl_timer_attivo:
+        if not self._attivo():
             return []
         async with aiosqlite.connect(self.db_path) as db:
             try:
@@ -217,7 +228,7 @@ class GestoreTimerHitl:
                 if corrente != interrupt_id:
                     await self.sincronizza(thread_id)  # già gestita dall'operatore
                     continue
-                azione = configurazione.hitl_azione_alla_scadenza
+                azione = self._azione()
                 if azione == SCADENZA_UMANO:
                     await self._imposta_stato(thread_id, STATO_SCADUTA_IN_ATTESA)
                     logger.warning("[TimerHITL] Timer scaduto sul thread '%s': il grafo resta in attesa dell'operatore.", thread_id)

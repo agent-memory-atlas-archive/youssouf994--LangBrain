@@ -1,0 +1,35 @@
+/* Colours and top navigation shared by every page (inserted by app/core/pagine_web.py where a page has the COMMON_CSS marker).
+   Light by default, dark when the system asks for it, and either one when the person picks it with the theme button
+   (data-theme on <html>, remembered in localStorage). Pages only use these tokens for their colours. */
+:root {
+  color-scheme: light;
+  --bg: #f5f6f8; --panel: #ffffff; --border: #d9dce3; --text: #1c2333; --text2: #475467; --muted: #667085; --soft: #eef1f6;
+  --accent: #2563eb; --grid: #e6e8ed; --axis: #c3c7d0;
+  --good: #0ca30c; --warning: #fab219; --critical: #d03b3b;
+  --ok: #16a34a; --warn: #d97706; --err: #dc2626;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4;
+  /* names used by the demo page */
+  --sfondo: var(--bg); --pannello: var(--panel); --bordo: var(--border); --testo: var(--text); --tenue: var(--muted);
+  --accento: var(--accent); --attenzione: var(--warn); --errore: var(--err); --nodo: var(--soft);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #0f131c; --panel: #171c28; --border: #2a3142; --text: #e6e9f0; --text2: #c3c9d6; --muted: #93a0b8; --soft: #202739;
+    --accent: #5b8cff; --grid: #252c3b; --axis: #3a4254;
+    --ok: #34d17a; --warn: #f0a441; --err: #f26b6b;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0f131c; --panel: #171c28; --border: #2a3142; --text: #e6e9f0; --text2: #c3c9d6; --muted: #93a0b8; --soft: #202739;
+  --accent: #5b8cff; --grid: #252c3b; --axis: #3a4254;
+  --ok: #34d17a; --warn: #f0a441; --err: #f26b6b;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181;
+}
+.topnav { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; }
+.topnav a { color: var(--text2); text-decoration: none; padding: 2px 0; border-bottom: 2px solid transparent; }
+.topnav a:hover { color: var(--text); }
+.topnav a[aria-current="page"] { color: var(--text); font-weight: 600; border-bottom-color: var(--accent); }
+.topnav button { font: inherit; font-size: 12.5px; color: var(--text2); background: var(--soft); border: 1px solid var(--border); border-radius: 14px; padding: 2px 10px; cursor: pointer; }

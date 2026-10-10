@@ -17,11 +17,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from app.core.constants import is_control_flag
+from app.core.constants import FINESTRA_SEGNALI_ORE_PREDEFINITA, is_control_flag
 
 logger = logging.getLogger(__name__)
 
 PERCORSO_PREDEFINITO = Path(__file__).resolve().parents[2] / "configurazione.toml"
+# Nome alternativo per chi preferisce i nomi inglesi: usato se configurazione.toml non esiste.
+PERCORSO_INGLESE = PERCORSO_PREDEFINITO.with_name("config.toml")
+
+
+def percorso_configurazione() -> Path:
+    """LANGBRAIN_CONFIG, altrimenti configurazione.toml, altrimenti config.toml."""
+    if os.getenv("LANGBRAIN_CONFIG"):
+        return Path(os.environ["LANGBRAIN_CONFIG"])
+    return PERCORSO_PREDEFINITO if PERCORSO_PREDEFINITO.exists() or not PERCORSO_INGLESE.exists() else PERCORSO_INGLESE
 
 POLITICA_RIFIUTA = "rifiuta"
 POLITICA_CONSENTI = "consenti"
@@ -82,6 +91,19 @@ class EsitoValidazione:
     motivo: str = ""
 
 
+@dataclass(frozen=True)
+class AttoreEsterno:
+    """
+    Un organo che scrive sul sistema nervoso senza essere un nodo del grafo (un sistema esterno, una centrale di
+    sicurezza, un agente di un altro processo). Il livello lo colloca nella gerarchia per le statistiche; la priorità
+    pesa i suoi blocchi sui dispositivi come quella di un agente registrato.
+    """
+    nome: str
+    livello: int = 1
+    priorita: float = 0.0
+    descrizione: str = ""
+
+
 @dataclass
 class Configurazione:
     llm_fallback: bool = False
@@ -98,6 +120,10 @@ class Configurazione:
     hitl_target_critici_brain: list[str] = field(default_factory=lambda: list(TARGET_CRITICI_BRAIN_PREDEFINITI))
     demo_conflitto_all_avvio: bool = False
     demo_pagina_web: bool = True
+    finestra_segnali_ore: float = FINESTRA_SEGNALI_ORE_PREDEFINITA   # `[segnali] finestra_ore`: quanto indietro arrivano i segnali nello stato
+    prompt: dict[str, str] = field(default_factory=dict)
+    lingua: str = "it"     # lingua dei prompt predefiniti, dei messaggi dell'API e delle pagine (it, en)
+    attori_esterni: dict[str, AttoreEsterno] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ dispositivi
 
@@ -195,8 +221,116 @@ def _interruttore(sezione: str, nome: str, valore: Any) -> bool:
     raise ErroreConfigurazione(f"[{sezione}] '{nome}' deve essere 0 o 1.")
 
 
+# ---------------------------------------------------------------------------------------------- nomi inglesi
+# Il file accetta i nomi italiani e quelli inglesi di sezioni, chiavi e valori (stesso significato). Internamente si
+# usano gli italiani; `[effectors.*]` è il nome del corpo umano di `[devices.*]` / `[dispositivi.*]`. Un file che usa entrambi i nomi per la stessa voce è rifiutato.
+LINGUE = ("it", "en")
+_SEZIONI_EN = {"general": "generale", "policy": "politica", "devices": "dispositivi", "effectors": "dispositivi", "prompts": "prompt",
+               "organism": "organismo", "signals": "segnali"}
+_CHIAVI_EN = {
+    "generale": {"language": "lingua"},
+    "llm": {"provider_order": "ordine_provider", "fallback_models": "modelli_di_ripiego"},
+    "hitl": {"timer_enabled": "timer_attivo", "default_timer_seconds": "timer_predefinito_secondi",
+             "on_timeout": "azione_alla_scadenza", "level": "livello", "brain_critical_targets": "target_critici_brain"},
+    "demo": {"seed_conflict_at_start": "conflitto_all_avvio", "web_page": "pagina_web"},
+    "politica": {"unlisted_devices": "dispositivi_non_elencati", "unlisted_effectors": "dispositivi_non_elencati"},
+    "segnali": {"window_hours": "finestra_ore"},
+    "organismo": {"external_actors": "attori_esterni"},
+    "prompt": {"brain_escalation_user": "brain_escalation_utente", "routine_check": "controllo_macro"},  # + alias delle estensioni
+}
+_CHIAVI_DISPOSITIVO_EN = {"values": "valori", "range": "intervallo", "unit": "unita", "active_value": "valore_attivo"}
+_CHIAVI_ATTORE_EN = {"level": "livello", "priority": "priorita", "description": "descrizione"}
+_VALORI_EN = {
+    ("hitl", "azione_alla_scadenza"): {"human": "umano", "system": "sistema", "reject": "respingi"},
+    ("hitl", "livello"): {"nodes": "nodi", "both": "entrambi"},
+    ("politica", "dispositivi_non_elencati"): {"reject": "rifiuta", "refuse": "rifiuta", "allow": "consenti"},
+}
+
+
+def _rinomina(dati: dict[str, Any], nomi: dict[str, str], dove: str) -> dict[str, Any]:
+    risultato = dict(dati)
+    for inglese, italiano in nomi.items():
+        if inglese in risultato:
+            if italiano in risultato:
+                raise ErroreConfigurazione(f"{dove}: '{inglese}' e '{italiano}' sono la stessa voce, usane una sola.")
+            risultato[italiano] = risultato.pop(inglese)
+    return risultato
+
+
+def normalizza_nomi(dati: dict[str, Any]) -> dict[str, Any]:
+    """Il contenuto del file con i nomi inglesi tradotti in quelli italiani usati dal codice."""
+    dati = _rinomina(dati, _SEZIONI_EN, "configurazione")
+    for sezione, nomi in _CHIAVI_EN.items():
+        if sezione == "prompt" and isinstance(dati.get(sezione), dict):
+            from app.core.estensioni import estensioni
+
+            nomi = {**nomi, **{k: v for e in estensioni() for k, v in e.alias_prompt.items()}}
+        if isinstance(dati.get(sezione), dict):
+            dati[sezione] = _rinomina(dati[sezione], nomi, f"[{sezione}]")
+    for (sezione, chiave), valori in _VALORI_EN.items():
+        valore = dati.get(sezione, {}).get(chiave) if isinstance(dati.get(sezione), dict) else None
+        if isinstance(valore, str) and valore in valori:
+            dati[sezione][chiave] = valori[valore]
+    if isinstance(dati.get("dispositivi"), dict):
+        dati["dispositivi"] = {nome: _rinomina(regola, _CHIAVI_DISPOSITIVO_EN, f"[dispositivi.{nome}]") if isinstance(regola, dict) else regola
+                               for nome, regola in dati["dispositivi"].items()}
+    attori = dati.get("organismo", {}).get("attori_esterni") if isinstance(dati.get("organismo"), dict) else None
+    if isinstance(attori, dict):
+        dati["organismo"]["attori_esterni"] = {nome: _rinomina(a, _CHIAVI_ATTORE_EN, f"[organismo.attori_esterni.{nome}]") if isinstance(a, dict) else a
+                                               for nome, a in attori.items()}
+    return dati
+
+
+def _sezione(dati: dict[str, Any], nome: str) -> dict[str, Any]:
+    sezione = dati.get(nome, {})
+    if not isinstance(sezione, dict):
+        raise ErroreConfigurazione(f"[{nome}] deve essere una sezione.")
+    return sezione
+
+
+def _prompt_da_dati(sezione: Any) -> dict[str, str]:
+    from app.core.prompt import ErrorePrompt, valida_prompt
+
+    if not isinstance(sezione, dict):
+        raise ErroreConfigurazione("[prompt] deve essere una sezione di testi.")
+    risultato = {}
+    for nome, testo in sezione.items():
+        try:
+            risultato[nome] = valida_prompt(nome, testo)
+        except ErrorePrompt as e:
+            raise ErroreConfigurazione(f"[prompt] {e}.") from e
+    return risultato
+
+
+def _attori_esterni_da_dati(sezione: Any) -> dict[str, AttoreEsterno]:
+    if not isinstance(sezione, dict):
+        raise ErroreConfigurazione("[organismo.attori_esterni] deve contenere una sezione per attore.")
+    risultato = {}
+    for nome, dati in sezione.items():
+        etichetta = f"[organismo.attori_esterni.{nome}]"
+        if not isinstance(dati, dict):
+            raise ErroreConfigurazione(f"{etichetta} deve essere una sezione.")
+        if nome.casefold().startswith("brain"):
+            raise ErroreConfigurazione(f"{etichetta} il Brain non è un attore esterno.")
+        livello = dati.get("livello", 1)
+        if not isinstance(livello, int) or isinstance(livello, bool) or livello < 1:
+            raise ErroreConfigurazione(f"{etichetta} 'livello' deve essere un intero maggiore o uguale a 1.")
+        priorita = dati.get("priorita", 0.0)
+        if not isinstance(priorita, (int, float)) or isinstance(priorita, bool) or not 0 <= priorita < float("inf"):
+            raise ErroreConfigurazione(f"{etichetta} 'priorita' deve essere un numero finito maggiore o uguale a 0.")
+        descrizione = dati.get("descrizione", "")
+        if not isinstance(descrizione, str):
+            raise ErroreConfigurazione(f"{etichetta} 'descrizione' deve essere un testo.")
+        risultato[nome] = AttoreEsterno(nome=nome, livello=livello, priorita=float(priorita), descrizione=descrizione)
+    return risultato
+
+
 def costruisci_configurazione(dati: dict[str, Any]) -> Configurazione:
-    """Costruisce e valida la configurazione a partire dal contenuto del file TOML."""
+    """Costruisce e valida la configurazione a partire dal contenuto del file TOML (nomi italiani o inglesi)."""
+    dati = normalizza_nomi(dati)
+    lingua = _sezione(dati, "generale").get("lingua", "it")
+    if lingua not in LINGUE:
+        raise ErroreConfigurazione(f"[generale] 'lingua' deve essere uno tra {', '.join(LINGUE)}.")
     llm = dati.get("llm", {})
     if not isinstance(llm.get("fallback", False), bool):
         raise ErroreConfigurazione("[llm] 'fallback' deve essere true o false.")
@@ -233,7 +367,12 @@ def costruisci_configurazione(dati: dict[str, Any]) -> Configurazione:
     if not isinstance(critici, list) or not all(isinstance(t, str) and t for t in critici):
         raise ErroreConfigurazione("[hitl] 'target_critici_brain' deve essere una lista di nomi di dispositivi.")
 
+    finestra = _sezione(dati, "segnali").get("finestra_ore", FINESTRA_SEGNALI_ORE_PREDEFINITA)
+    if not isinstance(finestra, (int, float)) or isinstance(finestra, bool) or not 0 < finestra <= 24 * 90:
+        raise ErroreConfigurazione("[segnali] 'finestra_ore' deve essere un numero maggiore di zero e al massimo 2160 (90 giorni).")
+
     configurazione = Configurazione(
+        finestra_segnali_ore=float(finestra),
         hitl_timer_attivo=_interruttore("hitl", "timer_attivo", hitl.get("timer_attivo", 0)),
         hitl_timer_secondi=durata,
         hitl_azione_alla_scadenza=azione,
@@ -246,6 +385,9 @@ def costruisci_configurazione(dati: dict[str, Any]) -> Configurazione:
         modelli_di_ripiego=ripiego,
         dispositivi_non_elencati=politica,
         regole=[_regola_da_dati(nome, sezione) for nome, sezione in dati.get("dispositivi", {}).items()],
+        prompt=_prompt_da_dati(dati.get("prompt", {})),
+        lingua=lingua,
+        attori_esterni=_attori_esterni_da_dati(_sezione(dati, "organismo").get("attori_esterni", {})),
     )
     # Il valore di attivazione deve essere a sua volta un comando ammesso dal dispositivo.
     for regola in configurazione.regole:
@@ -263,7 +405,7 @@ def carica_configurazione(percorso: str | os.PathLike | None = None) -> Configur
     precedente) e un avviso: senza elenco esplicito non c'è nulla da rifiutare.
     Solleva ErroreConfigurazione se il file esiste ma non è valido.
     """
-    percorso = Path(percorso or os.getenv("LANGBRAIN_CONFIG") or PERCORSO_PREDEFINITO)
+    percorso = Path(percorso or percorso_configurazione())
     if not percorso.exists():
         logger.warning("[Configurazione] File %s non trovato: uso i default, dispositivi non elencati consentiti.", percorso)
         return Configurazione(dispositivi_non_elencati=POLITICA_CONSENTI)
@@ -291,7 +433,7 @@ def _mtime(percorso: Path) -> int | None:
 def get_configurazione() -> Configurazione:
     """Configurazione corrente; se il file è cambiato dall'ultima lettura viene riletto (errori: resta la precedente)."""
     global _configurazione, _percorso_letto, _mtime_letto
-    percorso = Path(os.getenv("LANGBRAIN_CONFIG") or PERCORSO_PREDEFINITO)
+    percorso = percorso_configurazione()
     mtime = _mtime(percorso)
     if _configurazione is not None and percorso == _percorso_letto and mtime == _mtime_letto:
         return _configurazione
@@ -313,5 +455,5 @@ def imposta_configurazione(configurazione: Configurazione | None) -> None:
     """Sostituisce la configurazione condivisa (test). None forza una nuova lettura dal file."""
     global _configurazione, _percorso_letto, _mtime_letto
     _configurazione = configurazione
-    _percorso_letto = Path(os.getenv("LANGBRAIN_CONFIG") or PERCORSO_PREDEFINITO) if configurazione else None
+    _percorso_letto = percorso_configurazione() if configurazione else None
     _mtime_letto = _mtime(_percorso_letto) if configurazione else None

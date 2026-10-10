@@ -5,6 +5,9 @@ from datetime import datetime, timedelta, timezone
 import os
 from typing import Any
 
+# Finestra predefinita (ore) dei segnali dei recettori tenuti nello stato del grafo: `[segnali] finestra_ore`.
+FINESTRA_SEGNALI_ORE_PREDEFINITA = 4.0
+
 # TTL di default in minuti per la scadenza automatica dei flag di controllo (es. REJECTED, BLOCKED)
 DEFAULT_FLAG_TTL_MINUTES = int(os.getenv("FLAG_TTL_MINUTES", "60"))
 
@@ -52,3 +55,12 @@ def is_flag_expired(timestamp_str: str, ttl_minutes: int = DEFAULT_FLAG_TTL_MINU
         return event_time < cutoff
     except (ValueError, TypeError):
         return False
+
+
+# Livelli della gerarchia con i nomi del corpo umano: 0 Brain, 1 Organ, 2 Tissue, 3 e oltre Cell.
+NOMI_LIVELLI = ("Brain", "Organ", "Tissue", "Cell")
+
+
+def nome_livello(livello: int) -> str:
+    """Nome del livello (Brain, Organ, Tissue, Cell); oltre il terzo restano tutte Cell."""
+    return NOMI_LIVELLI[max(0, min(int(livello), len(NOMI_LIVELLI) - 1))]
