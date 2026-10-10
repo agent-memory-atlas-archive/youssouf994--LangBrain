@@ -1,5 +1,6 @@
 import logging
 from typing import Any
+from app.core import multiprocesso
 from app.core.risultati import ErroreTool
 from app.tools.reflex import Reflex
 
@@ -45,6 +46,10 @@ class SimulatedEffector(Reflex):
 
     async def get_tool_value(self) -> Any:
         self._verifica_guasto("lettura")
+        if multiprocesso.condiviso():  # più processi: il valore sta nel database, non nella memoria di uno solo
+            valore = await multiprocesso.leggi(f"effettore:{self.target_device}", multiprocesso.ASSENTE)
+            if valore is not multiprocesso.ASSENTE:
+                self._current_value = valore
         return self._current_value
 
     async def set_tool_value(self, value: Any) -> bool:
@@ -59,6 +64,8 @@ class SimulatedEffector(Reflex):
             display = raw
         logger.info(f"[Tool: {self.target_device}] Azionamento -> Nuovo valore: {display}")
         self._current_value = value
+        if multiprocesso.condiviso():
+            await multiprocesso.scrivi(f"effettore:{self.target_device}", value)
         return True
 
 

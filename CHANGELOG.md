@@ -36,6 +36,17 @@ routes and the old table are accepted as aliases. `tests/` still imports the old
   same command again (Docker: the process exits and the restart policy brings it back). `GET /config/api/fields` says
   `can_restart` for the key that asks.
 
+### Several people at once
+- `python -m app.serve` starts the API with several worker processes (`--workers N` or `LANGBRAIN_WORKERS`, default `auto`:
+  one per CPU, at most 4; the Docker image uses it). `app/core/multiprocesso.py` shares what lived in the memory of one
+  process: the runtime HITL configuration, the value of the simulated effectors and the compiled graph (recompiled when
+  another process changed the agents). Background tasks (the HITL timer, the tasks of installed nodes) run in one process at
+  a time (a lease on SQLite, with takeover if it dies), HITL operations on one thread exclude each other across processes,
+  SQLite runs in WAL mode with a 30 s wait and the startup migrations run one process at a time. **Restart app** works with
+  workers. With one process (`python -m uvicorn`) nothing changes and the database is not touched.
+- The uvicorn access log no longer writes a line for every successful request (the pages poll the API): errors and
+  refusals are still written; `LANGBRAIN_ACCESS_LOG=1` brings back the full log.
+
 ### Statistics for charts (generic parameters, any domain)
 - `GET /graph/stats` and `GET /graph/runs`: every execution of a graph node is recorded (`node_runs`: duration, outcome
   `ok`, `escalated`, `waiting`, `error`); the API returns runs, outcomes and median/p90 per node, transitions, waits for a

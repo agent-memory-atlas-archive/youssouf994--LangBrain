@@ -19,7 +19,7 @@ class NervousSystem:
         cutoff_time = (datetime.now(timezone.utc) - timedelta(minutes=self.frequency)).strftime("%Y-%m-%d %H:%M:%S")
         
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with aiosqlite.connect(self.db_path, timeout=30) as db:
                 db.row_factory = aiosqlite.Row
                 
                 if "all" in self.target:
@@ -50,7 +50,7 @@ class NervousSystem:
     ) -> None:
         """Registra un nuovo evento con old_value e new_value nel DB."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with aiosqlite.connect(self.db_path, timeout=30) as db:
                 await db.execute(
                     """INSERT INTO events (actor, action, target, old_value, new_value, reasoning, escalated) 
                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -78,7 +78,7 @@ class NervousSystem:
         if not righe:
             return 0
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with aiosqlite.connect(self.db_path, timeout=30) as db:
                 await db.executemany("INSERT INTO signals (receptor_id, agent_owner, value, unit) VALUES (?, ?, ?, ?)", righe)
                 await db.commit()
             return len(righe)
@@ -93,7 +93,7 @@ class NervousSystem:
         if receptor_id:
             query, params = query + " AND receptor_id = ?", params + [receptor_id]
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with aiosqlite.connect(self.db_path, timeout=30) as db:
                 db.row_factory = aiosqlite.Row
                 async with db.execute(query + " ORDER BY timestamp DESC, signal_id DESC", params) as cursor:
                     return [dict(row) for row in await cursor.fetchall()]
@@ -108,7 +108,7 @@ class NervousSystem:
         (`GET /graph/stats`): un errore qui viene registrato e NON rilanciato, la traccia non deve fermare il grafo.
         """
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with aiosqlite.connect(self.db_path, timeout=30) as db:
                 await db.execute(
                     "INSERT INTO node_runs (run_id, thread_id, node, started_at, duration_ms, outcome, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (run_id, thread_id, node, started_at, round(duration_ms, 2), outcome[:100], detail[:500]))
@@ -119,7 +119,7 @@ class NervousSystem:
     async def get_node_runs(self, hours: float = 24.0, run_id: str | None = None) -> list[dict]:
         """Le esecuzioni dei nodi delle run avviate nelle ultime `hours` ore (o di una sola run), in ordine di esecuzione."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with aiosqlite.connect(self.db_path, timeout=30) as db:
                 db.row_factory = aiosqlite.Row
                 if run_id:
                     query, params = "SELECT * FROM node_runs WHERE run_id = ? ORDER BY run_no", (run_id,)
@@ -143,7 +143,7 @@ class NervousSystem:
         Un errore del database viene registrato e rilanciato (come in `log_event`): chi chiama decide se fermarsi.
         """
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with aiosqlite.connect(self.db_path, timeout=30) as db:
                 result = await db.execute(
                     """UPDATE events
                        SET action = 'RESOLVED_' || action, escalated = 0
@@ -166,7 +166,7 @@ class NervousSystem:
         rilanciato: chi chiama non deve sbloccare il dispositivo se lo sblocco non è stato registrato.
         """
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with aiosqlite.connect(self.db_path, timeout=30) as db:
                 await db.execute(
                     """INSERT INTO events (actor, action, target, old_value, new_value, reasoning, escalated)
                        VALUES (?, 'UNBLOCKED', ?, 'REJECTED', 'OFF', ?, 0)""",
@@ -192,7 +192,7 @@ class NervousSystem:
         """
         cutoff_time = (datetime.now(timezone.utc) - timedelta(minutes=ttl_minutes)).strftime("%Y-%m-%d %H:%M:%S")
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with aiosqlite.connect(self.db_path, timeout=30) as db:
                 result = await db.execute(
                     """UPDATE events
                        SET action = 'EXPIRED_' || action, escalated = 0

@@ -6,8 +6,8 @@ conservano thread, stato e interrupt HITL pendenti, che sopravvivono a riavvii e
 La connessione è dedicata al checkpointer e va aperta nel lifespan dell'applicazione e chiusa allo spegnimento
 (un thread aiosqlite non chiuso impedisce l'uscita del processo).
 
-Limite: SQLite garantisce coerenza tra i processi che condividono il file, ma tool, registro HITL e stato dei
-device restano in memoria di processo: il deployment multi-worker richiede comunque un backend condiviso.
+Con più processi (`python -m app.serve --workers N`) il file è in modalità WAL e lo stato che prima stava solo in
+memoria (configurazione HITL, valore degli effettori simulati, grafo compilato) è condiviso: vedi `app/core/multiprocesso.py`.
 """
 
 import logging
@@ -15,6 +15,7 @@ import logging
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+from app.core import multiprocesso
 from app.db.database import DB_PATH
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ async def apri_checkpointer(db_path: str = DB_PATH) -> AsyncSqliteSaver:
 
     connessione = await aiosqlite.connect(db_path, timeout=TIMEOUT_DB_SECONDI)
     try:
+        await multiprocesso.abilita_wal(connessione)
         saver = AsyncSqliteSaver(connessione)
         await saver.setup()
     except Exception:

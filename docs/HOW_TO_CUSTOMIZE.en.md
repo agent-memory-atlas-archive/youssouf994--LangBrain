@@ -231,6 +231,38 @@ curl -H "X-API-Key: $API_KEY_OPERATOR" -X POST http://127.0.0.1:8000/graph/run -
 The smoke-test scripts send the header when the environment variable `API_KEY` is defined (so as admin). In Swagger
 (`/docs`) use the **Authorize** button.
 
+### Several people at once: workers
+
+`python -m uvicorn app.api.main:app` runs one process. To serve several people at the same time start the API with
+more processes (workers) that share the port and the SQLite database:
+
+```bash
+python -m app.serve                              # workers: LANGBRAIN_WORKERS, otherwise "auto" (one per CPU, at most 4)
+python -m app.serve --workers 4 --host 0.0.0.0 --port 8000
+```
+
+With more than one worker (`app/core/multiprocesso.py`):
+
+- **Background tasks run in one process at a time** (a lease on SQLite: if that process dies another takes over within a few
+  seconds): the HITL timer sweeper and the tasks of the installed nodes, for example reading a mailbox.
+- **What used to live only in the memory of one process is shared:** the runtime HITL configuration (`POST /hitl/config`),
+  the value of the simulated effectors, the ON/OFF switches of a node's tools and the compiled graph (an agent created in
+  one process is seen by the others at their next request).
+- **Operations on the same resource exclude each other across processes** (the HITL operations on one graph thread; a node can
+  use `multiprocesso.blocco(name)` for its own resources).
+- SQLite runs in WAL mode (readers do not block the writer) with a 30 s wait on a busy file; the startup migrations are
+  done by one process at a time.
+- **Restart app** from `/config` works with workers: the process that receives the request leaves a file, the supervisor stops
+  all the processes and starts again (in Docker it exits and the container policy restarts it).
+- With one worker (the default of `python -m uvicorn`) nothing of this touches the database: behaviour and tests are as before.
+
+Limits: the graph of the demo uses one conversation thread (`api_session`), so two people running `POST /graph/run` at the
+same time take turns; simulated faults (`POST /effectors/{id}/fault`) belong to the process that received them.
+
+**The access log.** uvicorn writes one INFO line per request, which with pages that poll the API is a flood. Successful
+requests (status below 400) are no longer written; errors and refusals still are. `LANGBRAIN_ACCESS_LOG=1` brings back
+the full log.
+
 ### Start with Docker Compose
 
 ```powershell
@@ -239,8 +271,8 @@ docker compose up --build
 ```
 
 The service is published on `http://127.0.0.1:8000` by default. Change the host port with `LANGBRAIN_PORT` in `.env`.
-SQLite is kept in the Docker volume `langbrain_data`. The container uses a single worker on purpose, because the tool
-registry and the HITL configuration are still in process memory (the checkpointer is on SQLite, in the same volume).
+SQLite is kept in the Docker volume `langbrain_data`. The container starts `python -m app.serve`: `LANGBRAIN_WORKERS`
+(default `auto`, at most 4) sets the number of processes, see "Several people at once: workers" above.
 
 To stop the service:
 

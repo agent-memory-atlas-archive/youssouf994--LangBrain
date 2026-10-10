@@ -26,7 +26,7 @@ python examples/avvia_demo.py                      # sample scenario + "graph in
 
 The demo creates a dedicated database (`demo.db`, your data is untouched), starts the server and opens `http://127.0.0.1:8765/demo`. Press **Esegui un ciclo** (run a cycle): the hierarchy nodes light up one after another while the agents (real models) reason, events and devices update and, when the Brain asks for approval on the door, you decide with **Approva** (approve) or **Respingi** (reject).
 
-For the real server: `python -m uvicorn app.api.main:app` or `docker compose up`. User choices (devices and allowed values, providers and models, HITL, timer) live in [`configurazione.toml`](configurazione.toml), secrets in `.env`. The full guide is [`docs/HOW_TO_CUSTOMIZE.md`](docs/HOW_TO_CUSTOMIZE.md) (in Italian); security and contributions are covered in [`SECURITY.md`](SECURITY.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md).
+For the real server: `python -m uvicorn app.api.main:app` (one process), `python -m app.serve` (several processes: the app can be used by several people at the same time) or `docker compose up`. User choices (devices and allowed values, providers and models, HITL, timer) live in [`configurazione.toml`](configurazione.toml), secrets in `.env`. The full guide is [`docs/HOW_TO_CUSTOMIZE.md`](docs/HOW_TO_CUSTOMIZE.md) (in Italian); security and contributions are covered in [`SECURITY.md`](SECURITY.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ---
 

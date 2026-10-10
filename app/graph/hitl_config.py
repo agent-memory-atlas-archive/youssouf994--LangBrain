@@ -68,6 +68,26 @@ class HitlConfigManager:
     def get_config(self) -> HitlConfigSchema:
         return self.config
 
+    # Con più processi (app/core/multiprocesso.py) la configurazione a runtime è nel database: chi la cambia la salva,
+    # gli altri la rileggono quando ne vedono salire la versione.
+    _versione_vista = 0
+
+    async def salva_condivisa(self) -> None:
+        from app.core import multiprocesso
+        if multiprocesso.condiviso():
+            self._versione_vista = await multiprocesso.scrivi("hitl", self.config.model_dump())
+
+    async def sincronizza(self) -> None:
+        from app.core import multiprocesso
+        if not multiprocesso.condiviso():
+            return
+        versione = (await multiprocesso.versioni("hitl"))["hitl"]
+        if versione != self._versione_vista:
+            dati = await multiprocesso.leggi("hitl")
+            if dati is not None:
+                self.config = HitlConfigSchema(**dati)
+            self._versione_vista = versione
+
     def update_config(
         self,
         hitl_all: bool | None = None,

@@ -11,7 +11,7 @@ known limits and the roadmap.
 LangBrain is a working boilerplate for hierarchical agent systems on LangGraph, with a demonstration domain (smart
 home), a test domain (medical homeostasis) and nodes that plug into the API as extensions (`app/nodes`). The full cycle Brain →
 organs → components, escalations, operator approval, the API, persistence on SQLite, basic security and the
-documentation are in order and covered by tests. **It is not production-ready**: it runs with a single worker, the
+documentation are in order and covered by tests. **It is not production-ready**: it runs with a single worker by default (several with `python -m app.serve`), the
 physical state of the (simulated) devices is in memory, observability is missing. The limits are listed below.
 
 ## What is there and verified
@@ -34,13 +34,14 @@ physical state of the (simulated) devices is in memory, observability is missing
 | Dependencies | Exact versions in `requirements.txt`, complete list in `requirements.lock`; `pip-audit` finds no known vulnerabilities. |
 | Tests | `python -m pytest tests`: temporary databases, no real LLM, the real databases are never touched. Mutation checks on the critical points; real runs with Mistral/OpenRouter/Gemini done by hand during development. |
 | CI and security | `.github/workflows/ci.yml` (tests on Python 3.12 and 3.14, gitleaks, pip-audit), `scripts/scansione_sicurezza.sh`, `SECURITY.md`, `CONTRIBUTING.md`. The CI is written but not yet run on GitHub: the first push will try it. |
-| Docker | `Dockerfile` and `docker-compose.yml` (SQLite volume, health check, one worker, tesseract for local OCR redaction). The image could not be built on the development machine (no Docker): try it at first use. |
+| Docker | `Dockerfile` and `docker-compose.yml` (SQLite volume, health check, `python -m app.serve` with `LANGBRAIN_WORKERS` workers, tesseract for local OCR redaction). The image could not be built on the development machine (no Docker): try it at first use. |
 
 ## Known limits
 
-- **One worker only.** Tools, runtime HITL configuration (`/hitl/config`) and the graph are in process memory;
-  checkpoints and HITL deadlines are on SQLite. Recompiling the graph is serialised by a lock, but several processes
-  would become inconsistent.
+- **Several workers share state through SQLite** (`python -m app.serve`, `app/core/multiprocesso.py`): background tasks
+  in one process at a time, runtime HITL configuration, simulated effector values, tool switches and the compiled graph
+  shared. Not shared: simulated faults, and the single `api_session` thread of the demo graph (runs take turns).
+  Plain `python -m uvicorn` is still one process.
 - **Physical state of the tools in memory**, not reconciled with the DB at restart; the tools are simulated (no
   hardware, MQTT or webhook adapter).
 - **Unused or unbounded data**: the `readings` table is not populated; `GraphState.reduce_readings` accumulates
@@ -99,7 +100,7 @@ intervals are partly hardcoded or left to the domain implementation.
 ### Docker Compose consistency
 
 `Dockerfile` and `docker-compose.yml` work: they expose the configurable port, use a SQLite volume, health check,
-single worker and explicit pass-through of the variables. `LOCAL_MODEL_DOCKER_BASE_URL` separates the endpoint seen
+a configurable number of workers and explicit pass-through of the variables. `LOCAL_MODEL_DOCKER_BASE_URL` separates the endpoint seen
 by the container from the native one; for a model on another LAN machine the two URLs can be the same.
 
 ## Roadmap
@@ -111,5 +112,5 @@ by the container from the native one; for a model on another LAN machine the two
 - [ ] Distributed tracing, metrics and correlation IDs.
 - [ ] Persistence of the physical state of the tools and hardware adapters.
 - [ ] Robust scheduler for health checks and TTL.
-- [ ] Multi-worker operation (shared state outside the process).
+- [x] Multi-worker operation (shared state on SQLite; a real device backend would replace the simulated effectors).
 - [ ] Test of concurrency and load.

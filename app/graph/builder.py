@@ -86,6 +86,7 @@ def wrap_node_with_hitl(node_name: str, agent_obj: Any):
     ovunque nel flusso prima o dopo l'esecuzione del nodo, in base alle regole dinamiche.
     """
     async def hitl_wrapped_agent_node(state: GraphState) -> dict[str, Any]:
+        await hitl_manager.sincronizza()  # con più processi: la configurazione HITL cambiata da un altro
         # 1. Intercettazione PRE-ESECUZIONE del nodo (flusso HITL "nodi": [hitl] livello in configurazione.toml)
         if flusso_nodi_attivo() and hitl_manager.should_interrupt(node_name, state):
             logger.warning(f"[HITL Interceptor] Invocazione interrupt() prima di eseguire il nodo '{node_name}'.")

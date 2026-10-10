@@ -16,6 +16,7 @@ import logging
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+import time
 import asyncio
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
@@ -26,11 +27,13 @@ from pydantic import BaseModel
 from app.api.settings_routes import register_routes as register_settings_routes
 from app.agents.agent_registry import AgenteConFigliError, AgentRegistry, ErroreGerarchia
 from app.checkpointer import apri_checkpointer, chiudi_checkpointer, get_checkpointer, svuota_checkpoint
+from app.core import multiprocesso
 from app.core.configurazione import get_configurazione
 from app.core.errori_llm import ErroreLLM, oscura_segreti
 from app.core.estensioni import carica_estensioni
 from app.core.lingua import scegli
 from app.core.pagine_web import INTESTAZIONI_PAGINA, risposta_pagina
+from app.core.registro_accessi import installa_filtro_accessi
 from app.core.modelli_agenti import (
     NOME_BRAIN, assicura_tabella as assicura_tabella_modelli, imposta_modello, leggi_modello, nome_canonico_brain,
     rimuovi_modello, risolvi_modello,
@@ -41,7 +44,7 @@ from app.core.ruoli import (
 )
 from app.db.database import Database
 from app.graph.builder import build_graph
-from app.graph.hitl_config import NON_IMPOSTATO, HitlConfigSchema
+from app.graph.hitl_config import NON_IMPOSTATO, HitlConfigSchema, hitl_manager
 from app.graph.timer_hitl import GestoreTimerHitl, timer_attivo
 from app.MAO.model_access_object import PROVIDER_NOTI, Mao, normalizza_provider
 from app.tools.nervous_system import NervousSystem as EventLog  # nome storico: i vecchi test lo sostituiscono con patch
@@ -62,9 +65,15 @@ _graph_lock = asyncio.Lock()
 gestore_timer = GestoreTimerHitl(lambda: _graph)
 
 
-async def _recompile_system_graph():
-    """Ricarica le istanze dal registro e ricompila il grafo LangGraph."""
-    global _graph, _shared_tools
+_versione_grafo_vista = 0
+
+
+async def _recompile_system_graph(propaga: bool = True):
+    """
+    Ricarica le istanze dal registro e ricompila il grafo LangGraph. Con più processi (`app/core/multiprocesso.py`)
+    `propaga` avvisa gli altri, che ricompilano alla richiesta successiva (vedi `sincronizza_stato`).
+    """
+    global _graph, _shared_tools, _versione_grafo_vista
     async with _graph_lock:
         agent_instances = await registry.build_agent_instances(_shared_tools)
         # Compilazione e swap atomici di grafico e tool condivisi
@@ -72,6 +81,23 @@ async def _recompile_system_graph():
         if checkpointer is None:
             logger.warning("Checkpointer SQLite non aperto: il grafo usa uno stato volatile in memoria.")
         _graph, _shared_tools = build_graph(custom_agent_instances=agent_instances, checkpointer=checkpointer)
+    if multiprocesso.condiviso():
+        _versione_grafo_vista = (await multiprocesso.scrivi("grafo", time.time())) if propaga else (await multiprocesso.versioni("grafo"))["grafo"]
+
+
+async def sincronizza_stato() -> None:
+    """
+    Con più processi: prima di ogni richiesta ricompila il grafo se un altro processo ha cambiato gli agenti e rilegge la
+    configurazione HITL se è cambiata. Con un processo solo non fa nulla.
+    """
+    if not multiprocesso.condiviso():
+        return
+    try:
+        if (await multiprocesso.versioni("grafo"))["grafo"] != _versione_grafo_vista:
+            await _recompile_system_graph(propaga=False)
+        await hitl_manager.sincronizza()
+    except Exception:
+        logger.exception("Sincronizzazione dello stato condiviso non riuscita: si prosegue con lo stato locale.")
 
 
 _intestazione_chiave = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -122,15 +148,19 @@ async def autentica_e_autorizza(request: Request, chiave: str | None = Security(
 async def lifespan(app: FastAPI):
     for avviso in avvisi_configurazione():
         logger.warning(avviso)
-    await db.init_db()
-    await registry.init_registry_db()
-    await assicura_tabella_modelli()
-    await gestore_timer.assicura_tabella()
-    await apri_checkpointer()
-    await _recompile_system_graph()
-    sorveglianza_timer = asyncio.create_task(gestore_timer.sorveglia())
-    # Compiti in background dei nodi installati (es. lettura di una casella di posta, scadenze proprie).
-    compiti_estensioni = [asyncio.create_task(compito()) for e in carica_estensioni() for compito in e.compiti]
+    async with multiprocesso.blocco("avvio"):  # più processi: schema e migrazioni si fanno una volta alla volta
+        await db.init_db()
+        await registry.init_registry_db()
+        await assicura_tabella_modelli()
+        await gestore_timer.assicura_tabella()
+        await apri_checkpointer()
+    await _recompile_system_graph(propaga=False)
+    installa_filtro_accessi()
+    # Compiti in background: con più processi ciascuno gira in uno solo alla volta (multiprocesso.compito_leader).
+    sorveglianza_timer = asyncio.create_task(multiprocesso.compito_leader("hitl_timer", gestore_timer.sorveglia))
+    # ...e quelli dei nodi installati (es. lettura di una casella di posta, scadenze proprie).
+    compiti_estensioni = [asyncio.create_task(multiprocesso.compito_leader(f"{e.nome}.{compito.__name__}", compito))
+                          for e in carica_estensioni() for compito in e.compiti]
     try:
         yield
     finally:
@@ -151,7 +181,7 @@ app = FastAPI(
     description="API FastAPI con LangGraph per la gestione gerarchica N-livelli (Cervello -> Organi -> Componenti)",
     version="2.1.0",
     lifespan=lifespan,
-    dependencies=[Depends(autentica_e_autorizza)],
+    dependencies=[Depends(autentica_e_autorizza), Depends(sincronizza_stato)],
 )
 
 register_settings_routes(app)
@@ -535,6 +565,7 @@ async def update_hitl_config(body: HitlConfigSchema):
     Imposta dinamica dei punti di interrupt HITL (nodi, target sensori, azioni) e l'attesa massima.
     """
     from app.graph.hitl_config import hitl_manager
+    await hitl_manager.sincronizza()
     updated = hitl_manager.update_config(
         hitl_all=body.hitl_all,
         hitl_nodes=body.hitl_nodes,
@@ -544,6 +575,7 @@ async def update_hitl_config(body: HitlConfigSchema):
         max_wait_seconds=body.max_wait_seconds if "max_wait_seconds" in body.model_fields_set else NON_IMPOSTATO,
         allow_override=getattr(body, "allow_override", None),
     )
+    await hitl_manager.salva_condivisa()
     return {"status": "updated", "config": updated}
 
 
@@ -1008,7 +1040,7 @@ async def reset_system_state():
     from app.graph.hitl_config import hitl_manager
 
     # 1. Svuota le tabelle SQLite (events, signals, agents_registry)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("DELETE FROM events")
         await db.execute("DELETE FROM signals")
         await db.execute("DELETE FROM node_runs")
@@ -1017,7 +1049,7 @@ async def reset_system_state():
         await db.commit()
     await assicura_tabella_modelli()
     await gestore_timer.assicura_tabella()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("DELETE FROM agent_models")
         await db.execute("DELETE FROM hitl_scadenze")
         await db.commit()
@@ -1025,6 +1057,7 @@ async def reset_system_state():
 
     # 2. Resetta HITL manager
     hitl_manager.update_config(hitl_all=False, hitl_nodes=[], hitl_targets=[], hitl_actions=[], max_wait_seconds=None)
+    await hitl_manager.salva_condivisa()
 
     # 3. Resetta lo stato dei tool IoT condivisi
     async with _graph_lock:

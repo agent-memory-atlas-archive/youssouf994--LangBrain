@@ -21,6 +21,7 @@ per quali tipi di interrupt vale.
 """
 
 import asyncio
+import contextlib
 import logging
 import math
 import time
@@ -28,6 +29,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 import aiosqlite
+
+from app.core import multiprocesso
 from langgraph.types import Command
 
 from app.core.configurazione import SCADENZA_SISTEMA, SCADENZA_UMANO, get_configurazione
@@ -90,12 +93,18 @@ class GestoreTimerHitl:
         self._tipi = tipi
         self._blocchi: dict[str, asyncio.Lock] = {}
 
-    def blocco(self, thread_id: str) -> asyncio.Lock:
-        """Serializza le operazioni sullo stesso thread: una ripresa dell'operatore e una scadenza non si sovrappongono."""
-        return self._blocchi.setdefault(thread_id, asyncio.Lock())
+    @contextlib.asynccontextmanager
+    async def blocco(self, thread_id: str):
+        """
+        Serializza le operazioni sullo stesso thread: una ripresa dell'operatore e una scadenza non si sovrappongono, né
+        nello stesso processo né, con più processi, tra processi diversi (app/core/multiprocesso.py).
+        """
+        async with self._blocchi.setdefault(thread_id, asyncio.Lock()):
+            async with multiprocesso.blocco(f"thread:{thread_id}", attesa=300, durata=600):
+                yield
 
     async def assicura_tabella(self) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=30) as db:
             await db.execute(_CREAZIONE_TABELLA)
             await db.commit()
 
@@ -117,7 +126,7 @@ class GestoreTimerHitl:
     # ------------------------------------------------------------------ registrazione e stato
 
     async def _riga(self, thread_id: str):
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=30) as db:
             async with db.execute(
                 "SELECT interrupt_id, tipo, creato_il, scade_il, durata_secondi, stato FROM hitl_scadenze WHERE thread_id = ?",
                 (thread_id,),
@@ -125,7 +134,7 @@ class GestoreTimerHitl:
                 return await cursore.fetchone()
 
     async def _elimina(self, thread_id: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=30) as db:
             await db.execute("DELETE FROM hitl_scadenze WHERE thread_id = ?", (thread_id,))
             await db.commit()
 
@@ -146,7 +155,7 @@ class GestoreTimerHitl:
         if riga is None or riga[0] != interrupt_id:
             ora = self._orologio()
             durata = self._durata()
-            async with aiosqlite.connect(self.db_path) as db:
+            async with aiosqlite.connect(self.db_path, timeout=30) as db:
                 await db.execute(
                     """INSERT OR REPLACE INTO hitl_scadenze (thread_id, interrupt_id, tipo, creato_il, scade_il, durata_secondi, stato)
                        VALUES (?, ?, ?, ?, ?, ?, 'attesa')""",
@@ -188,7 +197,7 @@ class GestoreTimerHitl:
 
     async def elenco(self) -> list[dict[str, Any]]:
         """Tutte le richieste in attesa con scadenza registrata, dalla più urgente."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=30) as db:
             try:
                 async with db.execute(
                     "SELECT thread_id, interrupt_id, tipo, creato_il, scade_il, durata_secondi, stato FROM hitl_scadenze ORDER BY scade_il"
@@ -211,7 +220,7 @@ class GestoreTimerHitl:
         """
         if not self._attivo():
             return []
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=30) as db:
             try:
                 async with db.execute(
                     "SELECT thread_id, interrupt_id, durata_secondi FROM hitl_scadenze WHERE stato = ? AND scade_il <= ?",
@@ -260,7 +269,7 @@ class GestoreTimerHitl:
         return respinti
 
     async def _imposta_stato(self, thread_id: str, stato: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=30) as db:
             await db.execute("UPDATE hitl_scadenze SET stato = ? WHERE thread_id = ?", (stato, thread_id))
             await db.commit()
 

@@ -71,7 +71,7 @@ async def azzera_database(db_path: str) -> None:
     eliminate e non solo svuotate: un database con uno schema vecchio o parziale non si potrebbe reinizializzare.
     Vanno ricreate con `Database.init_db()` e gli altri `assicura_tabella`; `crea_scenario` lo fa.
     """
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=30) as db:
         for tabella in TABELLE_DA_SVUOTARE:
             await db.execute(f"DROP TABLE IF EXISTS {tabella}")
         await db.commit()
@@ -116,7 +116,7 @@ async def crea_scenario(
     await registro._assicura_tabella()
     await assicura_tabella_modelli(db_path)
     await GestoreTimerHitl(lambda: None, db_path).assicura_tabella()
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=30) as db:
         await db.execute("DELETE FROM events")
         await db.commit()
 
@@ -131,7 +131,7 @@ async def crea_scenario(
     for agente, (provider, modello) in modelli.items():
         await imposta_modello(agente, normalizza_provider(provider), modello, db_path)
 
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=30) as db:
         for evento in STORICO_BASE:
             await _inserisci_evento(db, *evento)
         if scenario == "conflitto_porta":

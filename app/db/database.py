@@ -22,7 +22,10 @@ class Database:
                 raise
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with aiosqlite.connect(self.db_path, timeout=30) as db:
+                from app.core import multiprocesso  # import tardivo: multiprocesso usa DB_PATH di questo modulo
+
+                await multiprocesso.abilita_wal(db)
                 # 1. Tabella Eventi / Audit Log
                 await db.execute("""
                     CREATE TABLE IF NOT EXISTS events (

@@ -51,7 +51,7 @@ def nome_canonico_brain(nome: str) -> str:
 
 
 async def assicura_tabella(db_path: str = DB_PATH) -> None:
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=30) as db:
         await db.execute(_CREAZIONE_TABELLA)
         await db.commit()
 
@@ -59,7 +59,7 @@ async def assicura_tabella(db_path: str = DB_PATH) -> None:
 async def imposta_modello(nome: str, provider: str, modello: str | None, db_path: str = DB_PATH) -> None:
     """Imposta (o sostituisce) provider e modello propri dell'agente."""
     await assicura_tabella(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=30) as db:
         await db.execute(
             """INSERT INTO agent_models (agent_name, provider, model) VALUES (?, ?, ?)
                ON CONFLICT(agent_name) DO UPDATE SET provider = excluded.provider, model = excluded.model,
@@ -72,7 +72,7 @@ async def imposta_modello(nome: str, provider: str, modello: str | None, db_path
 async def rimuovi_modello(nome: str, db_path: str = DB_PATH) -> bool:
     """Toglie l'impostazione propria: l'agente torna a ereditare. Restituisce False se non ce n'era una."""
     await assicura_tabella(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=30) as db:
         risultato = await db.execute("DELETE FROM agent_models WHERE agent_name = ?", (nome,))
         await db.commit()
         return risultato.rowcount > 0
@@ -81,7 +81,7 @@ async def rimuovi_modello(nome: str, db_path: str = DB_PATH) -> bool:
 async def leggi_modello(nome: str, db_path: str = DB_PATH) -> tuple[str, str | None] | None:
     """Impostazione propria dell'agente (senza ereditarietà), oppure None."""
     await assicura_tabella(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=30) as db:
         async with db.execute("SELECT provider, model FROM agent_models WHERE agent_name = ?", (nome,)) as cursore:
             riga = await cursore.fetchone()
     return (riga[0], riga[1]) if riga else None
@@ -94,7 +94,7 @@ async def risolvi_modello(nome: str, db_path: str = DB_PATH) -> ModelloRisolto:
     """
     predefinito = ModelloRisolto(None, None, ORIGINE_PREDEFINITO)
     try:
-        async with aiosqlite.connect(db_path) as db:
+        async with aiosqlite.connect(db_path, timeout=30) as db:
             corrente = nome_canonico_brain(nome)
             visitati: set[str] = set()
             while corrente.casefold() not in visitati:

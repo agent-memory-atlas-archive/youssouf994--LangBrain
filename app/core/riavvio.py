@@ -4,6 +4,9 @@ Riavvio dell'applicazione dalla pagina /config (solo amministratore).
 Il processo si arresta in modo ordinato (stesso percorso di Ctrl+C: il `lifespan` chiude checkpointer e agente) e ne
 riparte uno uguale, con gli stessi argomenti, quando il vecchio è terminato. In Docker non si rilancia nulla: basta
 uscire, ci pensa `restart: unless-stopped`. Con `uvicorn --reload` il riavvio spetta al reloader.
+
+Con più processi (`python -m app.serve`, vedi app/serve.py) chi riceve la richiesta non può fermare gli altri: lascia
+un file (`LANGBRAIN_RESTART_FLAG`) e il supervisore ferma tutto e riparte, o esce in Docker.
 """
 
 import asyncio
@@ -17,6 +20,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 RITARDO_SECONDI = 1.0  # lascia il tempo di consegnare la risposta HTTP alla pagina
+VARIABILE_FILE = "LANGBRAIN_RESTART_FLAG"  # impostata da `app.serve`: dove un processo chiede il riavvio al supervisore
 
 # Attende la fine del processo `pid` e rilancia il comando. Gira in un interprete a parte, senza importare l'app.
 _ATTENDI_E_RILANCIA = """
@@ -42,6 +46,12 @@ subprocess.Popen(comando)
 """
 
 
+def file_richiesta() -> Path:
+    """Il file con cui un processo chiede il riavvio al supervisore (accanto al database)."""
+    from app.db.database import DB_PATH
+    return Path(DB_PATH).resolve().with_suffix(".restart")
+
+
 def in_docker() -> bool:
     return Path("/.dockerenv").exists() or os.getenv("LANGBRAIN_RESTART") == "exit"
 
@@ -62,6 +72,15 @@ def _avvia_rilancio() -> None:
 
 async def _riavvia_dopo_ritardo() -> None:
     await asyncio.sleep(RITARDO_SECONDI)
+    file = os.getenv(VARIABILE_FILE)
+    if file:  # c'è un supervisore (app.serve): ci pensa lui, a tutti i processi
+        try:
+            Path(file).write_text("restart", encoding="utf-8")
+        except OSError:
+            logger.exception("Riavvio annullato: impossibile lasciare la richiesta al supervisore.")
+        else:
+            logger.warning("Riavvio richiesto dalla pagina delle impostazioni: il supervisore ferma i processi e riparte.")
+        return
     try:
         if not in_docker():
             _avvia_rilancio()
@@ -79,4 +98,4 @@ def programma_riavvio() -> str:
     """Pianifica il riavvio e torna subito. Restituisce `docker` o `process` (come ripartirà)."""
     global _compito
     _compito = asyncio.get_running_loop().create_task(_riavvia_dopo_ritardo())
-    return "docker" if in_docker() else "process"
+    return "docker" if in_docker() else ("supervisor" if os.getenv(VARIABILE_FILE) else "process")

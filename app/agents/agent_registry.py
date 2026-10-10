@@ -184,7 +184,7 @@ class AgentRegistry:
         self._lock_scrittura = asyncio.Lock()
 
     async def _assicura_tabella(self) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=30) as db:
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS agents_registry (
                     name TEXT PRIMARY KEY,
@@ -257,7 +257,7 @@ class AgentRegistry:
                 )
             self._verifica_figli_dichiarati(registrata, config.get("sub_agent_names"), normalizzate)
 
-            async with aiosqlite.connect(self.db_path) as db:
+            async with aiosqlite.connect(self.db_path, timeout=30) as db:
                 await db.execute(
                     """INSERT INTO agents_registry
                        (name, level, parent_agent_name, managed_targets, sub_agent_names, system_prompt_template, conflict_window_minutes, priority_weight)
@@ -315,7 +315,7 @@ class AgentRegistry:
                 )
 
     async def _leggi_configs(self) -> list[dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=30) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT * FROM agents_registry ORDER BY level ASC, priority_weight DESC") as cursor:
                 righe = await cursor.fetchall()
@@ -354,7 +354,7 @@ class AgentRegistry:
 
             restanti = [c for c in configs if c["name"] != name]
             figli_derivati = _calcola_figli(restanti)
-            async with aiosqlite.connect(self.db_path) as db:
+            async with aiosqlite.connect(self.db_path, timeout=30) as db:
                 await db.execute("DELETE FROM agents_registry WHERE name = ?", (name,))
                 await db.executemany(
                     "UPDATE agents_registry SET sub_agent_names = ? WHERE name = ?",

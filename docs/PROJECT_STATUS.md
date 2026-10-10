@@ -29,11 +29,11 @@ LangBrain è un boilerplate funzionante per sistemi di agenti gerarchici su Lang
 | Dipendenze | Versioni esatte in `requirements.txt`, elenco completo in `requirements.lock`; `pip-audit` non trova vulnerabilità note. |
 | Test | `python -m pytest tests`: database temporanei, nessun LLM reale, i database veri non vengono mai toccati. Prove per mutazione sui punti critici; prove reali con Mistral/OpenRouter/Gemini eseguite a mano durante lo sviluppo. |
 | CI e sicurezza | `.github/workflows/ci.yml` (test su Python 3.12 e 3.14, gitleaks, pip-audit), `scripts/scansione_sicurezza.sh`, `SECURITY.md`, `CONTRIBUTING.md`. La CI è scritta ma non ancora eseguita su GitHub: il primo push la proverà. |
-| Docker | `Dockerfile` e `docker-compose.yml` (volume SQLite, health check, un worker). Non è stato possibile costruire l'immagine sulla macchina di sviluppo (Docker assente): va provata al primo uso. |
+| Docker | `Dockerfile` e `docker-compose.yml` (volume SQLite, health check, `python -m app.serve` con `LANGBRAIN_WORKERS` worker). Non è stato possibile costruire l'immagine sulla macchina di sviluppo (Docker assente): va provata al primo uso. |
 
 ## Limiti noti
 
-- **Un solo worker.** Tool, configurazione HITL a runtime (`/hitl/config`) e grafo sono in memoria del processo; checkpoint e scadenze HITL stanno su SQLite. La ricompilazione del grafo è serializzata da un lock, ma più processi diverrebbero incoerenti.
+- **Più worker condividono lo stato su SQLite** (`python -m app.serve`, `app/core/multiprocesso.py`): compiti in background in un processo alla volta, configurazione HITL a runtime, valori degli effettori simulati, interruttori dei tool e grafo compilato condivisi. Non condivisi: i guasti simulati e l'unico thread `api_session` del grafo dimostrativo (le esecuzioni si mettono in fila). `python -m uvicorn` resta un processo solo.
 - **Stato fisico dei tool in memoria**, non riconciliato con il DB al riavvio; i tool sono simulati (nessun adapter hardware, MQTT o webhook).
 - **Dati non usati o non limitati**: la tabella `readings` non viene popolata; `GraphState.reduce_readings` accumula senza finestra temporale.
 - **Registro eventi**: timestamp SQLite al secondo (eventi simultanei senza ordine garantito); gli errori DB in `mark_resolved`, `unblock_target` e TTL vengono rilanciati: `/events/unblock` e `/events/reset-conflicts` rispondono 503 senza toccare il dispositivo, il Brain completa il ciclo e avvisa l'operatore che l'escalation è rimasta aperta.
@@ -75,7 +75,7 @@ Le dipendenze sono fissate (2026-09-20):
 
 ### Coerenza Docker Compose
 
-`Dockerfile` e `docker-compose.yml` sono operativi: espongono la porta configurabile, usano un volume SQLite, health check, singolo worker e pass-through esplicito delle variabili. `LOCAL_MODEL_DOCKER_BASE_URL` separa l'endpoint visto dal container da quello nativo; per un modello su un'altra macchina LAN i due URL possono coincidere.
+`Dockerfile` e `docker-compose.yml` sono operativi: espongono la porta configurabile, usano un volume SQLite, health check, numero di worker configurabile e pass-through esplicito delle variabili. `LOCAL_MODEL_DOCKER_BASE_URL` separa l'endpoint visto dal container da quello nativo; per un modello su un'altra macchina LAN i due URL possono coincidere.
 
 ## Roadmap
 
@@ -86,6 +86,6 @@ Le dipendenze sono fissate (2026-09-20):
 - [ ] Tracing distribuito, metriche e correlation ID.
 - [ ] Persistenza dello stato fisico dei tool e adapter hardware.
 - [ ] Scheduler robusto per health check e TTL.
-- [ ] Funzionamento multi-worker (stato condiviso fuori dal processo).
+- [x] Funzionamento multi-worker (stato condiviso su SQLite; un backend di dispositivi reali sostituirebbe gli effettori simulati).
 - [ ] Dashboard operatore completa (la pagina `/demo` è solo dimostrativa).
 - [ ] Test di concorrenza e di carico.

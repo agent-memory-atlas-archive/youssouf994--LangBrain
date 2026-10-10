@@ -27,5 +27,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=3).read()" || exit 1
 
-# Un solo worker: tool registry e HITL manager sono in memoria di processo (checkpoint e stato HITL pendente stanno su SQLite).
-CMD ["python", "-m", "uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# Più processi (LANGBRAIN_WORKERS, predefinito auto): lo stato condiviso, i compiti in background e i blocchi sono in app/core/multiprocesso.py.
+CMD ["python", "-m", "app.serve", "--host", "0.0.0.0", "--port", "8000"]
