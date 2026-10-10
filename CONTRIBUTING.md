@@ -37,3 +37,9 @@ cp .env.example .env                # poi inserisci almeno una chiave di un prov
 
 `python examples/avvia_demo.py` avvia il server con uno scenario di prova su un database dedicato (`demo.db`) e apre la
 pagina che mostra il grafo in azione.
+
+## Nodi costruiti sul core
+
+Un caso d'uso (un nodo) non modifica il core: si aggancia con un modulo in `app/nodes/` che espone `ESTENSIONE`
+(`app/core/estensioni.py`, `docs/HOW_TO_CUSTOMIZE.md` sezione 10). Il core non deve mai nominare un nodo. Le modifiche al
+framework si fanno qui; i repository dei nodi le ricevono con un merge di `main` (workflow `notify-nodes.yml`).
